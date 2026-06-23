@@ -814,11 +814,43 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 	}
 
 	/**
+	 * Whether a stylesheet is a UnysonPlus *generated* stylesheet written to the
+	 * uploads directory - the design presets (`presets-*.css`), the theme design
+	 * tokens / header-footer custom CSS (`unysonplus-generated.css`), and any
+	 * other CSS the plugin renders into `wp-content/uploads/`. These carry the
+	 * user's live customizations and must sit just BELOW the child theme but
+	 * ABOVE the parent theme + framework, exactly as they print uncombined
+	 * (parent -> presets -> generated -> child). Detected by location so we catch
+	 * every generated file regardless of its enqueue handle.
+	 *
+	 * @param string $src
+	 * @return bool
+	 */
+	private function is_generated_css_src( $src ) {
+		if ( ! is_string( $src ) || $src === '' ) {
+			return false;
+		}
+		$uploads = wp_upload_dir();
+		if ( empty( $uploads['baseurl'] ) ) {
+			return false;
+		}
+		$base = $this->url_path_only( $uploads['baseurl'] ); // e.g. /wp-content/uploads/
+		return $base !== '' && stripos( $src, $base ) !== false;
+	}
+
+	/**
 	 * Cascade-authority bucket for a CSS handle (higher = wins):
 	 *   1 = anything else (core, plugins, framework, shortcodes),
 	 *   2 = the active PARENT theme,
-	 *   3 = the UnysonPlus design presets (handle `unysonplus-presets`),
+	 *   3 = the UnysonPlus design presets + generated customization CSS
+	 *       (the `unysonplus-presets` handle and anything rendered to uploads,
+	 *       e.g. `unysonplus-generated.css`), kept in frontend order,
 	 *   4 = the active CHILD theme (top authority).
+	 *
+	 * Bucket 3 is the fix for the cascade-inversion bug: the generated
+	 * customization CSS normally prints AFTER the parent theme, but the earlier
+	 * bucketing dropped it into bucket 1, so the parent theme then overrode the
+	 * user's customizations once everything was merged into one file.
 	 */
 	private function css_theme_bucket( $handle, $src ) {
 		$child = $this->url_path_only( get_stylesheet_directory_uri() ); // child (or the theme itself)
@@ -826,7 +858,7 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 		if ( is_string( $src ) && $src !== '' && $child !== '' && stripos( $src, $child ) !== false ) {
 			return 4;
 		}
-		if ( $this->is_preset_css_handle( $handle ) ) {
+		if ( $this->is_preset_css_handle( $handle ) || $this->is_generated_css_src( $src ) ) {
 			return 3;
 		}
 		$parent = $this->url_path_only( get_template_directory_uri() ); // parent
