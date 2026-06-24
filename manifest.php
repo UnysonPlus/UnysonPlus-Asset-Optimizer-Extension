@@ -5,6 +5,26 @@
 /**
  * Changelog ----------------------------------------------------------------
  *
+ * 1.1.25 - FIX: run the combine pass AFTER the theme's stylesheet orderer. The
+ *          combine hooks moved from wp_enqueue_scripts:9999 to :99999. The
+ *          UnysonPlus parent theme re-orders stylesheets via dependencies at
+ *          :9999 (parent-style -> presets -> hf-custom -> child); because the
+ *          plugin loads before the theme, our :9999 pass ran FIRST and captured
+ *          the pre-ordered cascade, baking the wrong order into the combined
+ *          file and breaking the header. Running last lets our dependency-
+ *          resolved capture reflect the theme's intended order.
+ *
+ * 1.1.24 - FIX: combining broke front-end layouts. The cascade bucketing hoisted
+ *          the WHOLE parent theme above the framework/shortcode CSS, which
+ *          dragged early base assets like header-footer-builder.css (normally
+ *          printed FIRST) to high authority and inverted the cascade. The parent
+ *          theme is no longer hoisted - it keeps its natural per-file frontend
+ *          order. Only the child theme (last) and the presets / generated
+ *          customization CSS (just below it) are floated to the end, which simply
+ *          reproduces the working uncombined cascade. Child-theme hoisting is
+ *          also now gated on is_child_theme() so a lone theme's early bases are
+ *          never sent to the end.
+ *
  * 1.1.20 - Cascade-aware CSS order. The combined stylesheet (and the settings
  *          list) now order the merged CSS as: everything else in true frontend
  *          print order, then the PARENT theme, then the UnysonPlus design
@@ -57,7 +77,7 @@ $manifest['description'] = __(
 	'fw'
 );
 
-$manifest['version']    = '1.1.23';
+$manifest['version']    = '1.1.25';
 $manifest['github_update'] = 'UnysonPlus/UnysonPlus-Asset-Optimizer-Extension';
 $manifest['display']    = true;
 $manifest['standalone'] = true;

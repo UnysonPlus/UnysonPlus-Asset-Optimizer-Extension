@@ -85,13 +85,20 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 			return;
 		}
 
-		add_action( 'wp_enqueue_scripts', array( $this, 'enqueue_combined_css' ), 9999 );
+		// Priority 99999 (PHP_INT_MAX-ish, well after the usual 9999 orderers):
+		// the active theme can re-order stylesheets via dependencies at
+		// wp_enqueue_scripts:9999 (UnysonPlus' parent theme does exactly this to
+		// build its parent-style -> presets -> hf-custom -> child cascade). We
+		// MUST run after that so our dependency-resolved capture reflects the
+		// theme's intended order; otherwise the combined file bakes in the wrong
+		// cascade and breaks layouts (e.g. the header).
+		add_action( 'wp_enqueue_scripts', array( $this, 'enqueue_combined_css' ), 99999 );
 
-		// Combine eligible footer scripts. Runs late on wp_enqueue_scripts so the
-		// bulk of registrations/enqueues are in place; works off the live,
-		// dependency-resolved script list (not the persisted map) because JS
-		// execution order is significant.
-		add_action( 'wp_enqueue_scripts', array( $this, 'enqueue_combined_js' ), 9999 );
+		// Combine eligible footer scripts. Same late priority so registrations,
+		// dependencies and any theme ordering are all in place; works off the
+		// live, dependency-resolved script list because JS execution order is
+		// significant.
+		add_action( 'wp_enqueue_scripts', array( $this, 'enqueue_combined_js' ), 99999 );
 
 		// Final safety net: at shutdown, remember every handle that was enqueued
 		// or printed during this request - including handles enqueued late by
@@ -840,31 +847,37 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 
 	/**
 	 * Cascade-authority bucket for a CSS handle (higher = wins):
-	 *   1 = anything else (core, plugins, framework, shortcodes),
-	 *   2 = the active PARENT theme,
-	 *   3 = the UnysonPlus design presets + generated customization CSS
-	 *       (the `unysonplus-presets` handle and anything rendered to uploads,
-	 *       e.g. `unysonplus-generated.css`), kept in frontend order,
-	 *   4 = the active CHILD theme (top authority).
+	 *   1 = everything else, INCLUDING the parent theme (natural frontend order),
+	 *   2 = the UnysonPlus design presets + generated customization CSS
+	 *       (the `unysonplus-presets` handle and anything rendered to uploads),
+	 *   3 = the active CHILD theme (top authority).
 	 *
-	 * Bucket 3 is the fix for the cascade-inversion bug: the generated
-	 * customization CSS normally prints AFTER the parent theme, but the earlier
-	 * bucketing dropped it into bucket 1, so the parent theme then overrode the
-	 * user's customizations once everything was merged into one file.
+	 * The PARENT theme is intentionally NOT hoisted. Its assets sit at very
+	 * different natural positions - e.g. header-footer-builder.css prints FIRST
+	 * (a base everything is meant to override) while style.css prints LATE,
+	 * already after the shortcodes. Lumping the whole theme into one high bucket
+	 * drags that early base above the framework/shortcodes and inverts the
+	 * cascade, which breaks layouts. Leaving the parent theme in bucket 1 keeps
+	 * each of its files in real order; the presets, generated CSS and child theme
+	 * are naturally last anyway, so floating them to the end just reproduces the
+	 * working uncombined cascade.
 	 */
 	private function css_theme_bucket( $handle, $src ) {
-		$child = $this->url_path_only( get_stylesheet_directory_uri() ); // child (or the theme itself)
-
-		if ( is_string( $src ) && $src !== '' && $child !== '' && stripos( $src, $child ) !== false ) {
-			return 4;
+		// The active CHILD theme gets top authority - but only when a child theme
+		// is actually in use. Otherwise the lone theme's assets (which include
+		// early bases like header-footer-builder.css) must keep their natural
+		// order, not all jump to the end.
+		if ( is_child_theme() && is_string( $src ) && $src !== '' ) {
+			$child = $this->url_path_only( get_stylesheet_directory_uri() );
+			if ( $child !== '' && stripos( $src, $child ) !== false ) {
+				return 3;
+			}
 		}
+		// UnysonPlus presets + generated customization CSS sit just below the child theme.
 		if ( $this->is_preset_css_handle( $handle ) || $this->is_generated_css_src( $src ) ) {
-			return 3;
-		}
-		$parent = $this->url_path_only( get_template_directory_uri() ); // parent
-		if ( is_string( $src ) && $src !== '' && $parent !== '' && $parent !== $child && stripos( $src, $parent ) !== false ) {
 			return 2;
 		}
+		// Everything else - including the parent theme - keeps natural order.
 		return 1;
 	}
 
@@ -882,12 +895,12 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 	 * @return string[]
 	 */
 	public function prioritize_css_handles( $handles, $src_map ) {
-		$buckets = array( 1 => array(), 2 => array(), 3 => array(), 4 => array() );
+		$buckets = array( 1 => array(), 2 => array(), 3 => array() );
 		foreach ( $handles as $handle ) {
 			$src = isset( $src_map[ $handle ] ) ? $src_map[ $handle ] : '';
 			$buckets[ $this->css_theme_bucket( $handle, $src ) ][] = $handle;
 		}
-		return array_merge( $buckets[1], $buckets[2], $buckets[3], $buckets[4] );
+		return array_merge( $buckets[1], $buckets[2], $buckets[3] );
 	}
 
 	/**
@@ -1856,6 +1869,16 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 			}
 
 			$css = str_replace( "\xEF\xBB\xBF", '', $css );
+
+			// Strip comments PER FILE with a string-aware scanner BEFORE merging.
+			// This is critical for robustness: a malformed comment in one source
+			// stylesheet (a stray `*/`, or an unclosed `/*` - e.g. a third-party
+			// plugin's CSS) must never corrupt the combined bundle. Stripping per
+			// file contains any imbalance to that file (an unclosed `/*` drops only
+			// the rest of THAT file, never the following stylesheets), so one bad
+			// stylesheet can't abort parsing for the entire merged file.
+			$css = $this->strip_css_comments( $css );
+
 			$css = preg_replace( '#@charset\s+[^;]+;\s*#i', '', $css );
 
 			$css = $this->rewrite_urls( $css, $item['src'] );
@@ -1890,6 +1913,74 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 	}
 
 	/**
+	 * Strips CSS comments with a single-pass, string-aware scanner.
+	 *
+	 * Robust against malformed input (the whole point of using this instead of a
+	 * `/*...*\/` regex):
+	 *   - an UNCLOSED `/*` drops the remainder of the string (when run per source
+	 *     file this contains the damage to that one file, never the next);
+	 *   - a STRAY `*\/` with no opener is simply dropped (it would be invalid CSS
+	 *     and could otherwise abort the parser for everything after it);
+	 *   - string literals ('...' / "...") are copied verbatim, so a `/*` or `*\/`
+	 *     inside a value (e.g. content: "*\/") is never mistaken for a delimiter.
+	 *
+	 * @param string $css
+	 * @return string
+	 */
+	private function strip_css_comments( $css ) {
+		$len = strlen( $css );
+		$out = '';
+		$i   = 0;
+
+		while ( $i < $len ) {
+			$c  = $css[ $i ];
+			$c2 = $i + 1 < $len ? $css[ $i + 1 ] : '';
+
+			// Comment open: skip to the matching close, or to EOF if unclosed.
+			if ( $c === '/' && $c2 === '*' ) {
+				$end = strpos( $css, '*/', $i + 2 );
+				if ( $end === false ) {
+					break; // unclosed - drop the rest (contained to this file)
+				}
+				$i = $end + 2;
+				continue;
+			}
+
+			// Stray close delimiter (malformed source) - drop it.
+			if ( $c === '*' && $c2 === '/' ) {
+				$i += 2;
+				continue;
+			}
+
+			// String literal - copy verbatim so delimiters inside can't fool us.
+			if ( $c === '"' || $c === "'" ) {
+				$q    = $c;
+				$out .= $c;
+				$i++;
+				while ( $i < $len ) {
+					$ch = $css[ $i ];
+					if ( $ch === '\\' && $i + 1 < $len ) {
+						$out .= $ch . $css[ $i + 1 ];
+						$i   += 2;
+						continue;
+					}
+					$out .= $ch;
+					$i++;
+					if ( $ch === $q ) {
+						break;
+					}
+				}
+				continue;
+			}
+
+			$out .= $c;
+			$i++;
+		}
+
+		return $out;
+	}
+
+	/**
 	 * Lightweight CSS minifier for the combined output.
 	 *
 	 * Strips comments and collapses non-significant whitespace. Deliberately
@@ -1899,9 +1990,12 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 	 * newlines/indentation and comments between the merged stylesheets.
 	 */
 	private function minify_css( $css ) {
-		// Remove CSS comments (not the rare ones that may live inside strings;
-		// real framework CSS doesn't carry those).
-		$css = preg_replace( '#/\*[\s\S]*?\*/#', '', $css );
+		// Remove CSS comments with the string-aware scanner (same one used per
+		// source file). At this point only the balanced "/* ==== handle ==== */"
+		// markers remain, but using the scanner instead of a non-greedy regex
+		// keeps comment handling uniformly safe - a regex would mis-pair across
+		// the whole concatenated string if any stray delimiter slipped through.
+		$css = $this->strip_css_comments( $css );
 
 		// Collapse every run of whitespace (incl. newlines/tabs) to one space.
 		$css = preg_replace( '#\s+#', ' ', $css );
