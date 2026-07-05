@@ -95,6 +95,65 @@ if ( empty( $js_choices ) ) {
 $options = array(
 	apply_filters( 'fw:ext:asset-optimizer:settings-options:before', array() ),
 
+	'tab_general' => array(
+		'type'    => 'tab',
+		'title'   => __( 'General', 'fw' ),
+		'options' => array(
+			'general_box' => array(
+				'title'   => __( 'General', 'fw' ),
+				'type'    => 'box',
+				'options' => array(
+					'group_general' => array(
+						'type'    => 'group',
+						'options' => array(
+							'general_intro' => array(
+								'type'  => 'html',
+								'label' => false,
+								'desc'  => false,
+								'html'  => '<p>' . esc_html__( 'Master switches for the combiner. Fine-grained per-file control lives on the CSS and JavaScript tabs.', 'fw' ) . '</p>',
+							),
+							'combine_css' => array(
+								'type'  => 'switch',
+								'label' => __( 'Combine CSS', 'fw' ),
+								'desc'  => __( 'Master switch for CSS combining. Turn off to serve stylesheets separately without touching your per-file selections on the CSS tab.', 'fw' ),
+								'value' => true,
+							),
+							'combine_js' => array(
+								'type'  => 'switch',
+								'label' => __( 'Combine JavaScript', 'fw' ),
+								'desc'  => __( 'Master switch for JavaScript combining. Turn off to serve scripts separately without touching your per-file selections on the JavaScript tab.', 'fw' ),
+								'value' => true,
+							),
+							'css_scope' => array(
+								'type'    => 'select',
+								'label'   => __( 'CSS combining scope', 'fw' ),
+								'desc'    => __( 'Site-wide: one shared stylesheet built from every stylesheet discovered across the site, cached and reused on every page (fewest downloads when visitors browse multiple pages). Per-page: each page combines ONLY the stylesheets it actually uses into its own file — smaller per page, in exact document order, but not shared across pages. JavaScript is always combined per-page.', 'fw' ),
+								'no-validate' => true,
+								'choices' => array(
+									'site'     => __( 'Site-wide (one shared bundle — default)', 'fw' ),
+									'per_page' => __( 'Per-page (each page combines its own CSS)', 'fw' ),
+								),
+								'value'   => 'site',
+							),
+							'logged_out_only' => array(
+								'type'  => 'switch',
+								'label' => __( 'Only for logged-out visitors', 'fw' ),
+								'desc'  => __( 'Serve the combined files only to visitors. Logged-in users (you) get the un-combined assets — handy while editing, and it sidesteps admin-bar edge cases.', 'fw' ),
+								'value' => false,
+							),
+							'exclude_urls' => array(
+								'type'  => 'textarea',
+								'label' => __( 'Exclude URLs', 'fw' ),
+								'desc'  => __( 'One path per line — the combiner is skipped on matching pages (assets load un-combined there). Match is against the request path; use * as a wildcard. Examples: /cart/  /checkout*  *?no-combine=1', 'fw' ),
+								'value' => '',
+							),
+						),
+					),
+				),
+			),
+		),
+	),
+
 	'tab_css' => array(
 		'type'    => 'tab',
 		'title'   => __( 'CSS', 'fw' ),

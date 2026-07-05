@@ -697,17 +697,187 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 		return $this->get_known_js_handles();
 	}
 
+	/* ---------------------------------------------------------------------
+	 * General settings (master toggles, logged-out-only, URL exclusions)
+	 * ------------------------------------------------------------------- */
+
+	/** Reads a General-tab setting straight from the store (frontend-safe). */
+	private function general_setting( $key, $default ) {
+		$store = get_option( 'fw_ext_settings_options:' . $this->get_name(), array() );
+		if ( ! is_array( $store ) || ! array_key_exists( $key, $store ) ) {
+			return $default;
+		}
+		return $store[ $key ];
+	}
+
+	/**
+	 * Whether the combiner should run for the given type ('css'|'js') on THIS
+	 * request - honoring the master switch, the logged-out-only option, and the
+	 * URL-exclusion list. All default to "combine".
+	 */
+	private function should_combine( $type ) {
+		if ( empty( $this->general_setting( 'js' === $type ? 'combine_js' : 'combine_css', true ) ) ) {
+			return false;
+		}
+		if ( ! empty( $this->general_setting( 'logged_out_only', false ) ) && is_user_logged_in() ) {
+			return false;
+		}
+		if ( $this->request_is_excluded() ) {
+			return false;
+		}
+		return true;
+	}
+
+	/** Whether the current request path matches any Exclude-URL pattern (* = wildcard). */
+	private function request_is_excluded() {
+		$raw = (string) $this->general_setting( 'exclude_urls', '' );
+		if ( trim( $raw ) === '' ) {
+			return false;
+		}
+		$path = isset( $_SERVER['REQUEST_URI'] ) ? (string) wp_unslash( $_SERVER['REQUEST_URI'] ) : '';
+		if ( $path === '' ) {
+			return false;
+		}
+		foreach ( preg_split( '/[\r\n]+/', $raw ) as $pattern ) {
+			$pattern = trim( $pattern );
+			if ( $pattern === '' ) {
+				continue;
+			}
+			if ( strpos( $pattern, '*' ) !== false ) {
+				$regex = '#' . str_replace( '\*', '.*', preg_quote( $pattern, '#' ) ) . '#i';
+				if ( preg_match( $regex, $path ) ) {
+					return true;
+				}
+			} elseif ( stripos( $path, $pattern ) !== false ) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/* ---------------------------------------------------------------------
+	 * Public combine API for cooperating extensions
+	 *
+	 * The Animation Engine enqueues its per-style CSS/JS partials LATE
+	 * (wp_footer:5) and ON-DEMAND (only the styles a page uses). Neither fits
+	 * our generic passes: the JS pass runs at wp_enqueue_scripts:99999 (before
+	 * the engine enqueues), and folding the on-demand CSS into the SITE-WIDE
+	 * bundle would break the engine's "ship only used styles" contract. So the
+	 * engine folds ITS OWN per-page partials via these helpers, honoring our
+	 * master switches / logged-out-only / URL-exclusion, while our site-wide
+	 * combiner leaves the engine's handles alone (it registers a
+	 * `css_exclude_handles` filter for them).
+	 * ------------------------------------------------------------------- */
+
+	/**
+	 * Whether combining is enabled for 'css'|'js' on THIS request (master
+	 * switch + logged-out-only + URL exclusions). Public entry point for
+	 * cooperating extensions.
+	 */
+	public function is_combine_enabled( $type ) {
+		return $this->should_combine( 'js' === $type ? 'js' : 'css' );
+	}
+
+	/**
+	 * Concatenate an ordered list of LOCAL files into one cached combined file
+	 * (CSS or JS) and return its public URL, or false if there's nothing to do.
+	 * The cache key is the ordered file set + mtimes, so different pages with
+	 * different style-sets get correctly distinct combined files (per-page).
+	 *
+	 * @param array  $files Ordered list of ['abs'=>absolute path, 'src'=>public URL, 'handle'=>id].
+	 * @param string $type  'css' | 'js'
+	 * @return string|false
+	 */
+	public function combine_files( array $files, $type ) {
+		$items = array();
+		foreach ( $files as $f ) {
+			$abs = isset( $f['abs'] ) ? $f['abs'] : '';
+			if ( ! $abs || ! is_readable( $abs ) ) {
+				continue;
+			}
+			$handle = isset( $f['handle'] ) && $f['handle'] !== '' ? $f['handle'] : basename( $abs );
+			if ( 'js' === $type ) {
+				$items[] = array( 'handle' => $handle, 'path' => $abs );
+			} else {
+				$items[] = array(
+					'handle' => $handle,
+					'src'    => isset( $f['src'] ) ? $f['src'] : '',
+					'path'   => $abs,
+					'media'  => 'all',
+				);
+			}
+		}
+		if ( count( $items ) < 2 ) {
+			return false;
+		}
+		if ( 'js' === $type ) {
+			return $this->build_combined_js_file( $items, ! empty( $this->general_setting( 'js_minify', false ) ) );
+		}
+		return $this->build_combined_css_file( $items );
+	}
+
+	/**
+	 * The combinable CSS handles enqueued on THIS request (per-page scope), as a
+	 * handle => src map - the live-queue analogue of get_known_css_handles().
+	 *
+	 * Runs at wp_enqueue_scripts:99999 (after the theme's stylesheet orderer, so
+	 * the dependency graph / eventual cascade order is resolved). Applies the same
+	 * filtering as the site-wide map (backend/admin, dead files) plus a media
+	 * guard (print/query-scoped sheets stay separate). The Animation Engine's
+	 * footer partials aren't enqueued yet, so they're naturally excluded - the
+	 * engine folds those itself.
+	 */
+	private function get_page_css_handles() {
+		global $wp_styles;
+		if ( ! ( $wp_styles instanceof WP_Styles ) ) {
+			return array();
+		}
+		$wp_styles->all_deps( $wp_styles->queue );
+
+		$handles = array();
+		foreach ( (array) $wp_styles->to_do as $handle ) {
+			if ( $handle === self::COMBINED_CSS_HANDLE ) {
+				continue;
+			}
+			$reg = isset( $wp_styles->registered[ $handle ] ) ? $wp_styles->registered[ $handle ] : null;
+			if ( ! $reg ) {
+				continue;
+			}
+			// Only 'all' / empty media - a print- or query-scoped sheet must stay separate.
+			$media = isset( $reg->args ) ? $reg->args : 'all';
+			if ( $media && 'all' !== $media ) {
+				continue;
+			}
+			$src = ! empty( $reg->src ) ? preg_replace( '#\?.*$#', '', (string) $reg->src ) : '';
+			if ( $src === '' ) {
+				continue;
+			}
+			if ( $this->is_backend_css_handle( $handle, $src ) || $this->src_is_dead( $src ) ) {
+				continue;
+			}
+			$handles[ $handle ] = $src;
+		}
+		return $handles;
+	}
+
 	/**
 	 * Builds and enqueues the combined stylesheet.
 	 *
-	 * Source list is the remembered handle map filtered by the user's
-	 * selections, so it's stable regardless of when individual handles
-	 * actually get enqueued during this request.
+	 * The handle SOURCE depends on the CSS scope. Site-wide (default): the
+	 * persisted map of every stylesheet ever discovered, cached and reused across
+	 * pages. Per-page: only the stylesheets THIS page enqueued, so its combined
+	 * file contains only its own CSS in exact document order. Everything
+	 * downstream (ordering, cascade priority, url-rewrite, minify, suppression)
+	 * is identical either way.
 	 *
 	 * @internal
 	 */
 	public function enqueue_combined_css() {
-		$known = $this->get_known_css_handles();
+		if ( ! $this->should_combine( 'css' ) ) {
+			return;
+		}
+		$per_page = ( 'per_page' === $this->general_setting( 'css_scope', 'site' ) );
+		$known    = $per_page ? $this->get_page_css_handles() : $this->get_known_css_handles();
 		if ( empty( $known ) ) {
 			return;
 		}
@@ -1249,6 +1419,9 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 		global $wp_scripts;
 
 		if ( ! ( $wp_scripts instanceof WP_Scripts ) ) {
+			return;
+		}
+		if ( ! $this->should_combine( 'js' ) ) {
 			return;
 		}
 

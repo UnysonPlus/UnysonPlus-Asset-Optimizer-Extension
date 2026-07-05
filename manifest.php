@@ -5,6 +5,32 @@
 /**
  * Changelog ----------------------------------------------------------------
  *
+ * 1.1.28 - Per-page CSS scope (new "CSS combining scope" option on the General
+ *          tab). Site-wide (default, unchanged): one shared stylesheet built from
+ *          every stylesheet ever discovered, cached and reused across pages.
+ *          Per-page: each page combines ONLY the stylesheets it enqueued into its
+ *          own file, in exact document order - smaller per page and cascade-exact,
+ *          but not shared across pages. Implemented by sourcing handles from the
+ *          live $wp_styles queue instead of the persisted map; all ordering /
+ *          minify / suppression is shared. (JavaScript is already per-page.)
+ *
+ * 1.1.27 - Public combine API for cooperating extensions. Two methods -
+ *          is_combine_enabled( 'css'|'js' ) and combine_files( $ordered, 'css'|'js' )
+ *          - let another extension fold its OWN per-page assets into one cached
+ *          request while honoring the master switches / logged-out-only / URL
+ *          exclusions. The Animation Engine uses this to combine its on-demand
+ *          per-style partials without breaking its "ship only used styles"
+ *          contract (its `css_exclude_handles` filter keeps the site-wide
+ *          combiner from also absorbing those handles).
+ *
+ * 1.1.26 - New "General" settings tab with master controls: "Combine CSS" and
+ *          "Combine JavaScript" on/off switches (quick kill switches that don't
+ *          touch the per-file selections), "Only for logged-out visitors" (serve
+ *          combined files to visitors while logged-in users get the un-combined
+ *          assets), and an "Exclude URLs" list (one path per line, * wildcard) so
+ *          the combiner is skipped on chosen pages (e.g. /cart/, /checkout*).
+ *          All gate both the CSS and JS combine passes and default to "combine".
+ *
  * 1.1.25 - FIX: run the combine pass AFTER the theme's stylesheet orderer. The
  *          combine hooks moved from wp_enqueue_scripts:9999 to :99999. The
  *          UnysonPlus parent theme re-orders stylesheets via dependencies at
@@ -77,7 +103,7 @@ $manifest['description'] = __(
 	'fw'
 );
 
-$manifest['version']    = '1.1.25';
+$manifest['version']    = '1.1.28';
 $manifest['github_update'] = 'UnysonPlus/UnysonPlus-Asset-Optimizer-Extension';
 $manifest['display']    = true;
 $manifest['standalone'] = true;
