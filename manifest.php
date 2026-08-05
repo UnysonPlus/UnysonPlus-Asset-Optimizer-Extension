@@ -5,6 +5,13 @@
 /**
  * Changelog ----------------------------------------------------------------
  *
+ * 1.1.29 - "Minify combined script" now defaults ON. The conservative JS
+ *          minifier (string/template/regex-aware, preserves line breaks) runs on
+ *          the combined bundle out of the box so it isn't flagged as unminified;
+ *          an explicit saved "off" still wins, so anyone who turned it off keeps
+ *          that. (Defer stays opt-in - it's a footer bundle, so deferring has
+ *          little upside and can reorder scripts that expect it synchronously.)
+ *
  * 1.1.28 - Per-page CSS scope (new "CSS combining scope" option on the General
  *          tab). Site-wide (default, unchanged): one shared stylesheet built from
  *          every stylesheet ever discovered, cached and reused across pages.
@@ -103,7 +110,7 @@ $manifest['description'] = __(
 	'fw'
 );
 
-$manifest['version']    = '1.1.28';
+$manifest['version']    = '1.1.32';
 $manifest['github_update'] = 'UnysonPlus/UnysonPlus-Asset-Optimizer-Extension';
 $manifest['display']    = true;
 $manifest['standalone'] = true;

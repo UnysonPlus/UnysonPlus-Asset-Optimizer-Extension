@@ -211,8 +211,8 @@ $options = array(
 							'js_minify' => array(
 								'type'  => 'switch',
 								'label' => __( 'Minify combined script', 'fw' ),
-								'desc'  => __( 'Strip comments and redundant whitespace from the combined bundle. Conservative (string/template/regex-aware, preserves line breaks for safety). Most scripts are already minified, so the extra saving is usually small. Experimental — leave off unless you want it.', 'fw' ),
-								'value' => false,
+								'desc'  => __( 'Strip comments and redundant whitespace from the combined bundle. Conservative (string/template/regex-aware, preserves line breaks for safety). On by default; turn off only if you hit an issue with an already-minified third-party script you have combined.', 'fw' ),
+								'value' => true,
 							),
 							'js_handles' => array(
 								'type'    => 'checkboxes',

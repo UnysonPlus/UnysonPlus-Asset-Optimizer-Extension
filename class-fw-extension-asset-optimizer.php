@@ -9,7 +9,7 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 	const CSS_EXCLUDED_OPTION      = 'fw_ext_asset_optimizer_css_excluded';
 	const COMBINED_CSS_HANDLE      = 'unysonplus-asset-optimizer-css';
 	const COMBINED_JS_HANDLE       = 'unysonplus-asset-optimizer-js';
-	const CACHE_SUBDIR             = 'unysonplus-asset-optimizer';
+	const CACHE_SUBDIR             = 'unysonplus/asset-optimizer';
 	const DISCOVERY_QUERY_ARG      = 'fw_asset_optimizer_discover';
 	const MIGRATION_OPTION         = 'fw_ext_asset_optimizer_migrated_v1';
 	const ACTION_CLEAR_CACHE       = 'fw_asset_optimizer_clear_cache';
@@ -643,9 +643,14 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 
 		// Backend asset paths: WordPress core admin, and Unyson / extension
 		// option-type styles which only load inside the builder/options UI.
+		// Also the dashicons FILE regardless of which handle registered it (e.g.
+		// `fw-option-type-wp-editor-dashicons` points at wp-includes/css/
+		// dashicons.min.css) - it's the wp-admin/editor icon font; visitors never
+		// need its ~46KB of icon rules in the bundle.
 		static $needles = array(
 			'/wp-admin/',
 			'/includes/option-types/',
+			'/wp-includes/css/dashicons',
 		);
 		foreach ( $needles as $needle ) {
 			if ( stripos( $src, $needle ) !== false ) {
@@ -811,7 +816,7 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 			return false;
 		}
 		if ( 'js' === $type ) {
-			return $this->build_combined_js_file( $items, ! empty( $this->general_setting( 'js_minify', false ) ) );
+			return $this->build_combined_js_file( $items, ! empty( $this->general_setting( 'js_minify', true ) ) );
 		}
 		return $this->build_combined_css_file( $items );
 	}
@@ -895,7 +900,10 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 		// can override all the combined framework/shortcode CSS.
 		$ordered = $this->prioritize_css_handles( $ordered, $known );
 
-		$items = array();
+		$items        = array();
+		$seen_paths   = array(); // resolved path => first handle
+		$dupe_handles = array(); // handles whose FILE is already in the bundle under another handle
+
 		foreach ( $ordered as $handle ) {
 			if ( $handle === self::COMBINED_CSS_HANDLE ) {
 				continue;
@@ -912,6 +920,17 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 			if ( ! $path || ! is_readable( $path ) ) {
 				continue;
 			}
+
+			// De-dupe by FILE: two handles can point at the same stylesheet (e.g.
+			// `font-awesome` and the icon-pack handle both registering
+			// font-awesome.min.css). Concatenate it once; the duplicate handle's
+			// tag still gets suppressed below since its content is in the bundle.
+			$path_key = strtolower( wp_normalize_path( $path ) );
+			if ( isset( $seen_paths[ $path_key ] ) ) {
+				$dupe_handles[] = $handle;
+				continue;
+			}
+			$seen_paths[ $path_key ] = $handle;
 
 			$items[ $handle ] = array(
 				'handle' => $handle,
@@ -931,6 +950,9 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 		}
 
 		foreach ( $items as $handle => $_ ) {
+			$this->absorbed_css_handles[ $handle ] = true;
+		}
+		foreach ( $dupe_handles as $handle ) {
 			$this->absorbed_css_handles[ $handle ] = true;
 		}
 
@@ -1438,7 +1460,8 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 		$store     = get_option( 'fw_ext_settings_options:' . $this->get_name(), array() );
 		$has_saved = is_array( $store ) && isset( $store['js_handles'] ) && is_array( $store['js_handles'] );
 		$saved     = $has_saved ? $store['js_handles'] : array();
-		$minify    = ! empty( $store['js_minify'] );
+		// js_minify defaults ON: unset -> minify; an explicit saved false wins.
+		$minify    = array_key_exists( 'js_minify', $store ) ? ! empty( $store['js_minify'] ) : true;
 		$defer     = ! empty( $store['js_defer'] );
 
 		/**
@@ -1489,8 +1512,9 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 
 		// Pass 3: resolve to on-disk paths (in dependency order) and collect the
 		// external deps the bundle still needs (e.g. jQuery core).
-		$items = array();
-		$deps  = array();
+		$items      = array();
+		$deps       = array();
+		$seen_paths = array();
 		foreach ( $ordered as $handle ) {
 			if ( ! isset( $absorb[ $handle ] ) ) {
 				continue;
@@ -1502,6 +1526,14 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 				unset( $absorb[ $handle ] );
 				continue;
 			}
+			// De-dupe by FILE: if two handles register the same script, include it
+			// once; the duplicate stays in $absorb so its tag is still suppressed.
+			$path_key = strtolower( wp_normalize_path( $path ) );
+			if ( isset( $seen_paths[ $path_key ] ) ) {
+				continue;
+			}
+			$seen_paths[ $path_key ] = true;
+
 			$items[] = array( 'handle' => $handle, 'path' => $path );
 			foreach ( (array) $reg->deps as $d ) {
 				if ( ! isset( $absorb[ $d ] ) ) {
@@ -2018,7 +2050,7 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 		// 'fmt' token participates in the hash so changing the output format
 		// (e.g. enabling minification) invalidates previously cached files and
 		// forces a one-time regeneration.
-		$signature = array( 'fmt:min1' );
+		$signature = array( 'fmt:min2' );
 		foreach ( $items as $item ) {
 			$signature[] = $item['handle'] . '|' . $item['path'] . '|' . filemtime( $item['path'] );
 		}
@@ -2170,18 +2202,65 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 		// the whole concatenated string if any stray delimiter slipped through.
 		$css = $this->strip_css_comments( $css );
 
-		// Collapse every run of whitespace (incl. newlines/tabs) to one space.
-		$css = preg_replace( '#\s+#', ' ', $css );
+		// String-aware whitespace tightening. String literals are copied
+		// VERBATIM (so `content: "a: b"` keeps its exact text). Outside strings,
+		// each whitespace run is dropped entirely when it sits next to a
+		// character where CSS whitespace is insignificant, else collapsed to a
+		// single space. Deliberate asymmetries:
+		//   - space AFTER  `:` is removed (`margin: 0` -> `margin:0`) but space
+		//     BEFORE `:` is kept (`li :hover` = descendant + pseudo);
+		//   - space AFTER  `(` is removed but space BEFORE `(` is kept
+		//     (`@media screen and (min-width:…)` requires it);
+		//   - `+` and `~` are never touched (calc() / value math).
+		$len = strlen( $css );
+		$out = '';
+		$i   = 0;
+		while ( $i < $len ) {
+			$c = $css[ $i ];
 
-		// Drop whitespace around purely structural characters. `>` is the only
-		// safe combinator to tighten (`+ ~` are skipped to avoid touching
-		// calc()/value math).
-		$css = preg_replace( '#\s*([{};,>])\s*#', '$1', $css );
+			if ( '"' === $c || "'" === $c ) { // string literal - copy verbatim
+				$q    = $c;
+				$out .= $c;
+				$i++;
+				while ( $i < $len ) {
+					$ch   = $css[ $i ];
+					$out .= $ch;
+					$i++;
+					if ( '\\' === $ch && $i < $len ) {
+						$out .= $css[ $i ];
+						$i++;
+						continue;
+					}
+					if ( $ch === $q ) {
+						break;
+					}
+				}
+				continue;
+			}
+
+			if ( false !== strpos( " \t\n\r\f", $c ) ) {
+				while ( $i < $len && false !== strpos( " \t\n\r\f", $css[ $i ] ) ) {
+					$i++;
+				}
+				$prev = '' === $out ? '' : substr( $out, -1 );
+				$next = $i < $len ? $css[ $i ] : '';
+				if ( '' === $prev || '' === $next
+					|| false !== strpos( '{};,>:(', $prev )
+					|| false !== strpos( '{};,>)', $next ) ) {
+					continue; // insignificant - drop the whitespace entirely
+				}
+				$out .= ' ';
+				continue;
+			}
+
+			$out .= $c;
+			$i++;
+		}
 
 		// Remove the now-redundant final semicolon before a closing brace.
-		$css = str_replace( ';}', '}', $css );
+		$out = str_replace( ';}', '}', $out );
 
-		return trim( $css );
+		return trim( $out );
 	}
 
 	/**
