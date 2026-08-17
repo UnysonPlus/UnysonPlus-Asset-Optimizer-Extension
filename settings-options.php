@@ -127,13 +127,13 @@ $options = array(
 							'css_scope' => array(
 								'type'    => 'select',
 								'label'   => __( 'CSS combining scope', 'fw' ),
-								'desc'    => __( 'Site-wide: one shared stylesheet built from every stylesheet discovered across the site, cached and reused on every page (fewest downloads when visitors browse multiple pages). Per-page: each page combines ONLY the stylesheets it actually uses into its own file — smaller per page, in exact document order, but not shared across pages. JavaScript is always combined per-page.', 'fw' ),
+								'desc'    => __( 'Per-page (default): each page combines ONLY the stylesheets it actually uses into its own file — smaller per page, in exact document order (best Lighthouse / GTmetrix “unused CSS” scores). Site-wide: one shared stylesheet built from every stylesheet discovered across the site, reused on every page (fewest downloads when a visitor browses many pages, but ships CSS the page does not use). JavaScript is always combined per-page.', 'fw' ),
 								'no-validate' => true,
 								'choices' => array(
-									'site'     => __( 'Site-wide (one shared bundle — default)', 'fw' ),
-									'per_page' => __( 'Per-page (each page combines its own CSS)', 'fw' ),
+									'per_page' => __( 'Per-page (each page combines its own CSS — default)', 'fw' ),
+									'site'     => __( 'Site-wide (one shared bundle)', 'fw' ),
 								),
-								'value'   => 'site',
+								'value'   => 'per_page',
 							),
 							'logged_out_only' => array(
 								'type'  => 'switch',

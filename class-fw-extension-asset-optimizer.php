@@ -2,6 +2,9 @@
 	die( 'Forbidden' );
 }
 
+// Standalone, dependency-free CSS/JS minifiers (extracted for testability).
+require_once __DIR__ . '/includes/class-fw-ao-minifier.php';
+
 class FW_Extension_Asset_Optimizer extends FW_Extension {
 
 	const KNOWN_CSS_HANDLES_OPTION = 'fw_ext_asset_optimizer_known_css_handles';
@@ -11,7 +14,9 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 	const COMBINED_JS_HANDLE       = 'unysonplus-asset-optimizer-js';
 	const CACHE_SUBDIR             = 'unysonplus/asset-optimizer';
 	const DISCOVERY_QUERY_ARG      = 'fw_asset_optimizer_discover';
+	const DISCOVERY_TOKEN_PREFIX   = 'fw_ao_discover_';
 	const MIGRATION_OPTION         = 'fw_ext_asset_optimizer_migrated_v1';
+	const AUTOLOAD_FIX_OPTION      = 'fw_ext_asset_optimizer_autoload_v2';
 	const ACTION_CLEAR_CACHE       = 'fw_asset_optimizer_clear_cache';
 	const ACTION_RESCAN            = 'fw_asset_optimizer_rescan';
 	const NONCE_ACTION             = 'fw_asset_optimizer_maintenance';
@@ -57,6 +62,7 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 	 */
 	public function _init() {
 		$this->maybe_migrate();
+		$this->maybe_fix_autoload();
 
 		// Maintenance hooks (admin / cron context). Auto-purge the cache when the
 		// active asset set can change, plus the settings-page action buttons.
@@ -114,12 +120,21 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 		// Blank the <script src> tag for any handle folded into the combined JS.
 		add_filter( 'script_loader_tag', array( $this, 'suppress_absorbed_js_tag' ), 0, 2 );
 
-		// Force a fresh render when explicitly discovering from the admin.
+		// Force a fresh render for the internal discovery crawl - but ONLY for a
+		// request carrying a valid one-time token (set by discover_handles()).
+		// Without this gate any anonymous visitor could append the query arg to
+		// bypass full-page caching on every request (a cheap cache-buster / DoS
+		// amplifier). The loopback crawl has no login session, so the token - not
+		// a capability check - is what authorises it.
 		if ( isset( $_GET[ self::DISCOVERY_QUERY_ARG ] ) ) {
-			if ( ! defined( 'DONOTCACHEPAGE' ) ) {
-				define( 'DONOTCACHEPAGE', true );
+			$token = sanitize_text_field( wp_unslash( $_GET[ self::DISCOVERY_QUERY_ARG ] ) );
+			if ( $token !== '' && get_transient( self::DISCOVERY_TOKEN_PREFIX . $token ) ) {
+				delete_transient( self::DISCOVERY_TOKEN_PREFIX . $token ); // single use
+				if ( ! defined( 'DONOTCACHEPAGE' ) ) {
+					define( 'DONOTCACHEPAGE', true );
+				}
+				nocache_headers();
 			}
-			nocache_headers();
 		}
 	}
 
@@ -395,13 +410,33 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 	 * Cache maintenance (purge + the settings-page action buttons)
 	 * ------------------------------------------------------------------- */
 
-	/** Absolute path to the cache directory, or '' if uploads is unavailable. */
-	private function cache_dir() {
+	/**
+	 * { path, url } of the combined-file cache directory - the ONE source of
+	 * truth for the cache location. Routes through the shared uploads helper
+	 * (fw_upw_uploads_dir), which enforces the uploads/unysonplus/<subdir>
+	 * convention project-wide; CACHE_SUBDIR is only the fallback literal for
+	 * when the helper isn't loaded. Returns empty strings if uploads is
+	 * unavailable. No trailing slash.
+	 *
+	 * @return array{path:string,url:string}
+	 */
+	private function combined_paths() {
+		if ( function_exists( 'fw_upw_uploads_dir' ) ) {
+			return fw_upw_uploads_dir( 'asset-optimizer' );
+		}
 		$uploads = wp_upload_dir();
 		if ( ! empty( $uploads['error'] ) ) {
-			return '';
+			return array( 'path' => '', 'url' => '' );
 		}
-		return trailingslashit( $uploads['basedir'] ) . self::CACHE_SUBDIR;
+		return array(
+			'path' => wp_normalize_path( trailingslashit( $uploads['basedir'] ) . self::CACHE_SUBDIR ),
+			'url'  => trailingslashit( $uploads['baseurl'] ) . self::CACHE_SUBDIR,
+		);
+	}
+
+	/** Absolute path to the cache directory, or '' if uploads is unavailable. */
+	private function cache_dir() {
+		return $this->combined_paths()['path'];
 	}
 
 	/** Deletes every combined CSS/JS file in the cache directory. */
@@ -528,7 +563,7 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 		// 1. Migrate the discovered-handles map.
 		$old_known = get_option( 'fw_ext_css_combiner_known_handles', null );
 		if ( is_array( $old_known ) && ! empty( $old_known ) ) {
-			update_option( self::KNOWN_CSS_HANDLES_OPTION, $old_known, true );
+			update_option( self::KNOWN_CSS_HANDLES_OPTION, $old_known, false );
 		}
 		delete_option( 'fw_ext_css_combiner_known_handles' );
 
@@ -570,6 +605,32 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 	}
 
 	/**
+	 * One-time: drop the discovered-handle maps from autoload on installs that
+	 * saved them before this version (they were stored with autoload=yes).
+	 * update_option alone can't fix a STABLE map - WP skips the autoload change
+	 * when the value is unchanged - so delete + re-add is needed to force
+	 * autoload=no. New writes already pass false. These maps are only read on
+	 * the frontend combine pass + settings page, so autoloading them taxed every
+	 * admin / cron / REST / AJAX request for nothing.
+	 *
+	 * The guard flag is itself autoloaded (a 1-byte scalar), so this check is a
+	 * free in-memory read on every subsequent request - no extra query.
+	 */
+	private function maybe_fix_autoload() {
+		if ( get_option( self::AUTOLOAD_FIX_OPTION ) ) {
+			return;
+		}
+		foreach ( array( self::KNOWN_CSS_HANDLES_OPTION, self::KNOWN_JS_HANDLES_OPTION ) as $opt ) {
+			$val = get_option( $opt, null );
+			if ( null !== $val ) {
+				delete_option( $opt );
+				add_option( $opt, $val, '', false ); // autoload = no
+			}
+		}
+		update_option( self::AUTOLOAD_FIX_OPTION, 1, true ); // tiny flag: autoload OK
+	}
+
+	/**
 	 * Returns the map of every CSS handle ever seen on the frontend:
 	 *   array( handle => src )
 	 *
@@ -579,17 +640,29 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 	 * combiner both go through here.
 	 */
 	public function get_known_css_handles() {
+		// Memoized: filtering calls src_is_dead()->url_to_path() (a disk stat) for
+		// every stored handle, and this getter is hit from several call sites in
+		// one request (the combine pass, the settings page, exclusion recompute).
+		// The underlying option only changes at shutdown (remember_css_handles,
+		// which invalidates this cache), so one filter pass per request suffices.
+		if ( null !== $this->known_css_cache ) {
+			return $this->known_css_cache;
+		}
 		$known = get_option( self::KNOWN_CSS_HANDLES_OPTION, array() );
 		if ( ! is_array( $known ) ) {
-			return array();
+			return $this->known_css_cache = array();
 		}
 		foreach ( $known as $handle => $src ) {
 			if ( $this->is_backend_css_handle( $handle, $src ) || $this->src_is_dead( $src ) ) {
 				unset( $known[ $handle ] );
 			}
 		}
-		return $known;
+		return $this->known_css_cache = $known;
 	}
+	/** @var array|null Per-request cache for get_known_css_handles(). */
+	private $known_css_cache = null;
+	/** @var array|null Per-request cache for get_known_js_handles(). */
+	private $known_js_cache = null;
 
 	/**
 	 * Whether a remembered src is "dead" - a SAME-HOST (or root-relative) asset
@@ -667,52 +740,63 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 	 * request triggers both shutdown sweeps, so callers don't need two hits.
 	 */
 	public function discover_handles() {
-		$url = add_query_arg( self::DISCOVERY_QUERY_ARG, time(), home_url( '/' ) );
+		// One-time token authorising the cache-bust on the crawled request (see
+		// _init). Short TTL - the crawl completes in seconds - and single-use.
+		$token = wp_generate_password( 24, false );
+		set_transient( self::DISCOVERY_TOKEN_PREFIX . $token, 1, MINUTE_IN_SECONDS );
 
-		wp_remote_get(
-			$url,
-			array(
-				'timeout'   => 15,
-				'sslverify' => false,
-				'headers'   => array(
-					'Cache-Control' => 'no-cache, no-store, max-age=0',
-					'Pragma'        => 'no-cache',
-				),
-				'cookies'   => array(),
-			)
+		$url  = add_query_arg( self::DISCOVERY_QUERY_ARG, $token, home_url( '/' ) );
+		$args = array(
+			'timeout' => 15,
+			'headers' => array(
+				'Cache-Control' => 'no-cache, no-store, max-age=0',
+				'Pragma'        => 'no-cache',
+			),
+			'cookies' => array(),
 		);
+
+		// Verify TLS by default; only a certificate failure on this self-loopback
+		// (e.g. a self-signed local cert) falls back to unverified - never a
+		// blanket disable. Discovery is best-effort anyway (the shutdown sweeps
+		// also populate the maps organically), so a hard failure is non-fatal.
+		$res = wp_remote_get( $url, $args );
+		if ( is_wp_error( $res ) && false !== stripos( $res->get_error_message(), 'ssl' ) ) {
+			$args['sslverify'] = false;
+			wp_remote_get( $url, $args );
+		}
 
 		wp_cache_delete( self::KNOWN_CSS_HANDLES_OPTION, 'options' );
 		wp_cache_delete( self::KNOWN_JS_HANDLES_OPTION, 'options' );
-	}
-
-	/**
-	 * Back-compat wrapper: discover and return the CSS handle map.
-	 */
-	public function discover_css_handles() {
-		$this->discover_handles();
-		return $this->get_known_css_handles();
-	}
-
-	/**
-	 * Discover and return the JS handle map.
-	 */
-	public function discover_js_handles() {
-		$this->discover_handles();
-		return $this->get_known_js_handles();
 	}
 
 	/* ---------------------------------------------------------------------
 	 * General settings (master toggles, logged-out-only, URL exclusions)
 	 * ------------------------------------------------------------------- */
 
+	/**
+	 * The extension's settings store, memoized for the request. general_setting()
+	 * is hit ~8-12x per request (should_combine alone reads it 3x, plus css_scope
+	 * and both combine passes); the store never changes mid-request on the front
+	 * end (admin saves redirect via PRG), so reading it once is safe and saves the
+	 * repeated fetch + array validation.
+	 *
+	 * @var array|null
+	 */
+	private $settings_store_cache = null;
+
+	/** Memoized settings store (frontend-safe; see $settings_store_cache). */
+	private function settings_store() {
+		if ( null === $this->settings_store_cache ) {
+			$store                      = get_option( 'fw_ext_settings_options:' . $this->get_name(), array() );
+			$this->settings_store_cache = is_array( $store ) ? $store : array();
+		}
+		return $this->settings_store_cache;
+	}
+
 	/** Reads a General-tab setting straight from the store (frontend-safe). */
 	private function general_setting( $key, $default ) {
-		$store = get_option( 'fw_ext_settings_options:' . $this->get_name(), array() );
-		if ( ! is_array( $store ) || ! array_key_exists( $key, $store ) ) {
-			return $default;
-		}
-		return $store[ $key ];
+		$store = $this->settings_store();
+		return array_key_exists( $key, $store ) ? $store[ $key ] : $default;
 	}
 
 	/**
@@ -881,7 +965,7 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 		if ( ! $this->should_combine( 'css' ) ) {
 			return;
 		}
-		$per_page = ( 'per_page' === $this->general_setting( 'css_scope', 'site' ) );
+		$per_page = ( 'site' !== $this->general_setting( 'css_scope', 'per_page' ) );
 		$known    = $per_page ? $this->get_page_css_handles() : $this->get_known_css_handles();
 		if ( empty( $known ) ) {
 			return;
@@ -1184,8 +1268,11 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 		}
 
 		if ( $changed ) {
-			update_option( self::KNOWN_CSS_HANDLES_OPTION, $known, true );
+			// autoload = false: this map is only read on the frontend combine
+			// pass + the settings page, so it must NOT load on every request.
+			update_option( self::KNOWN_CSS_HANDLES_OPTION, $known, false );
 			wp_cache_delete( self::KNOWN_CSS_HANDLES_OPTION, 'options' );
+			$this->known_css_cache = null; // invalidate the per-request memo
 		}
 	}
 
@@ -1322,16 +1409,20 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 	 * Backend/core handles are stripped on the way out (self-healing list).
 	 */
 	public function get_known_js_handles() {
+		// Memoized like get_known_css_handles() (invalidated by remember_js_handles).
+		if ( null !== $this->known_js_cache ) {
+			return $this->known_js_cache;
+		}
 		$known = get_option( self::KNOWN_JS_HANDLES_OPTION, array() );
 		if ( ! is_array( $known ) ) {
-			return array();
+			return $this->known_js_cache = array();
 		}
 		foreach ( $known as $handle => $src ) {
 			if ( $this->is_backend_js_handle( $handle, $src ) || $this->src_is_dead( $src ) ) {
 				unset( $known[ $handle ] );
 			}
 		}
-		return $known;
+		return $this->known_js_cache = $known;
 	}
 
 	/**
@@ -1457,8 +1548,8 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 		// Read the saved selection straight from the settings store (not via
 		// fw_get_db_ext_settings_option) so resolving it on the frontend can
 		// never load settings-options.php / trigger a discovery request.
-		$store     = get_option( 'fw_ext_settings_options:' . $this->get_name(), array() );
-		$has_saved = is_array( $store ) && isset( $store['js_handles'] ) && is_array( $store['js_handles'] );
+		$store     = $this->settings_store();
+		$has_saved = isset( $store['js_handles'] ) && is_array( $store['js_handles'] );
 		$saved     = $has_saved ? $store['js_handles'] : array();
 		// js_minify defaults ON: unset -> minify; an explicit saved false wins.
 		$minify    = array_key_exists( 'js_minify', $store ) ? ! empty( $store['js_minify'] ) : true;
@@ -1697,8 +1788,10 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 		}
 
 		if ( $changed ) {
-			update_option( self::KNOWN_JS_HANDLES_OPTION, $known, true );
+			// autoload = false (see remember_css_handles): frontend-only data.
+			update_option( self::KNOWN_JS_HANDLES_OPTION, $known, false );
 			wp_cache_delete( self::KNOWN_JS_HANDLES_OPTION, 'options' );
+			$this->known_js_cache = null; // invalidate the per-request memo
 		}
 	}
 
@@ -1711,13 +1804,12 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 	 * a file boundary can't fuse two statements.
 	 */
 	private function build_combined_js_file( $items, $minify = false ) {
-		$uploads = wp_upload_dir();
-		if ( ! empty( $uploads['error'] ) ) {
+		$paths    = $this->combined_paths();
+		$dir      = $paths['path'];
+		$url_base = $paths['url'];
+		if ( $dir === '' ) {
 			return false;
 		}
-
-		$dir      = trailingslashit( $uploads['basedir'] ) . self::CACHE_SUBDIR;
-		$url_base = trailingslashit( $uploads['baseurl'] ) . self::CACHE_SUBDIR;
 
 		if ( ! wp_mkdir_p( $dir ) ) {
 			return false;
@@ -1761,208 +1853,18 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 		}
 
 		if ( $minify ) {
-			$output = $this->minify_js( $output );
+			$output = FW_AO_Minifier::js( $output );
 		}
 
 		if ( file_put_contents( $filepath, $output, LOCK_EX ) === false ) {
 			return false;
 		}
 
-		$this->cleanup_old_files( $dir, $filename );
+		$this->maybe_gc( $dir, $filename );
 
 		return $fileurl;
 	}
 
-	/**
-	 * Conservative, opt-in JS minifier.
-	 *
-	 * A single-pass character scanner that is aware of strings ('...', "..."),
-	 * template literals (`...`, passed through verbatim including ${...}), regex
-	 * literals, and line/block comments. It only does the SAFE transforms:
-	 *   - strip comments;
-	 *   - collapse runs of horizontal whitespace to a single space;
-	 *   - collapse blank lines and drop indentation.
-	 * Crucially it PRESERVES single newlines, so automatic-semicolon-insertion
-	 * can't change the program's meaning (e.g. a bare `return\n5`). It never
-	 * rewrites tokens, so it can't fuse identifiers or mangle operators.
-	 *
-	 * Regex-vs-division is resolved with the standard heuristic (the previous
-	 * significant char / keyword). When in doubt it treats `/` as division and
-	 * simply emits it verbatim - which is lossless, just less compressed.
-	 */
-	private function minify_js( $js ) {
-		$len      = strlen( $js );
-		$out      = '';
-		$i        = 0;
-		$prev_sig = '';   // last significant char emitted
-		$word     = '';   // current identifier/keyword run (for regex heuristic)
-
-		$append = static function ( $s ) use ( &$out ) {
-			$out .= $s;
-		};
-
-		while ( $i < $len ) {
-			$c  = $js[ $i ];
-			$c2 = $i + 1 < $len ? $js[ $i + 1 ] : '';
-
-			// Line comment - drop to end of line (newline handled next loop).
-			if ( $c === '/' && $c2 === '/' ) {
-				$i += 2;
-				while ( $i < $len && $js[ $i ] !== "\n" && $js[ $i ] !== "\r" ) {
-					$i++;
-				}
-				continue;
-			}
-
-			// Block comment - drop entirely.
-			if ( $c === '/' && $c2 === '*' ) {
-				$i += 2;
-				while ( $i < $len && ! ( $js[ $i ] === '*' && ( $i + 1 < $len ) && $js[ $i + 1 ] === '/' ) ) {
-					$i++;
-				}
-				$i += 2;
-				continue;
-			}
-
-			// String literal.
-			if ( $c === '"' || $c === "'" ) {
-				$q = $c;
-				$append( $c );
-				$i++;
-				while ( $i < $len ) {
-					$ch = $js[ $i ];
-					if ( $ch === '\\' && $i + 1 < $len ) {
-						$append( $ch . $js[ $i + 1 ] );
-						$i += 2;
-						continue;
-					}
-					$append( $ch );
-					$i++;
-					if ( $ch === $q ) {
-						break;
-					}
-				}
-				$prev_sig = $q;
-				$word     = '';
-				continue;
-			}
-
-			// Template literal - pass through verbatim (incl. ${...}).
-			if ( $c === '`' ) {
-				$append( $c );
-				$i++;
-				while ( $i < $len ) {
-					$ch = $js[ $i ];
-					if ( $ch === '\\' && $i + 1 < $len ) {
-						$append( $ch . $js[ $i + 1 ] );
-						$i += 2;
-						continue;
-					}
-					$append( $ch );
-					$i++;
-					if ( $ch === '`' ) {
-						break;
-					}
-				}
-				$prev_sig = '`';
-				$word     = '';
-				continue;
-			}
-
-			// Regex literal (only when a regex is grammatically allowed here).
-			if ( $c === '/' && $this->js_regex_allowed( $prev_sig, $word ) ) {
-				$append( $c );
-				$i++;
-				$in_class = false;
-				while ( $i < $len ) {
-					$ch = $js[ $i ];
-					if ( $ch === '\\' && $i + 1 < $len ) {
-						$append( $ch . $js[ $i + 1 ] );
-						$i += 2;
-						continue;
-					}
-					$append( $ch );
-					$i++;
-					if ( $ch === '[' ) {
-						$in_class = true;
-					} elseif ( $ch === ']' ) {
-						$in_class = false;
-					} elseif ( $ch === '/' && ! $in_class ) {
-						break;
-					} elseif ( $ch === "\n" || $ch === "\r" ) {
-						break; // malformed - bail safely
-					}
-				}
-				while ( $i < $len && ctype_alpha( $js[ $i ] ) ) { // flags
-					$append( $js[ $i ] );
-					$i++;
-				}
-				$prev_sig = '/';
-				$word     = '';
-				continue;
-			}
-
-			// Horizontal whitespace - collapse to one space (never before a newline).
-			if ( $c === ' ' || $c === "\t" || $c === "\f" || $c === "\v" ) {
-				while ( $i < $len && ( $js[ $i ] === ' ' || $js[ $i ] === "\t" || $js[ $i ] === "\f" || $js[ $i ] === "\v" ) ) {
-					$i++;
-				}
-				$last = $out === '' ? '' : substr( $out, -1 );
-				if ( $last !== '' && $last !== "\n" && $last !== ' ' ) {
-					$append( ' ' );
-				}
-				continue;
-			}
-
-			// Newlines - collapse runs (and adjacent ws) to a single \n.
-			if ( $c === "\n" || $c === "\r" ) {
-				while ( $i < $len && ( $js[ $i ] === "\n" || $js[ $i ] === "\r" || $js[ $i ] === ' ' || $js[ $i ] === "\t" ) ) {
-					$i++;
-				}
-				$out = rtrim( $out, " \t" );
-				if ( $out !== '' && substr( $out, -1 ) !== "\n" ) {
-					$append( "\n" );
-				}
-				continue;
-			}
-
-			// Significant char.
-			$append( $c );
-			$prev_sig = $c;
-			if ( ctype_alnum( $c ) || $c === '_' || $c === '$' ) {
-				$word .= $c;
-			} else {
-				$word = '';
-			}
-			$i++;
-		}
-
-		return trim( $out );
-	}
-
-	/**
-	 * Whether a `/` at this point begins a regex literal (vs. division), using
-	 * the standard previous-significant-token heuristic.
-	 *
-	 * @param string $prev_sig Last significant char emitted.
-	 * @param string $word     Trailing identifier/keyword run, if any.
-	 */
-	private function js_regex_allowed( $prev_sig, $word ) {
-		if ( $prev_sig === '' ) {
-			return true;
-		}
-		if ( strpos( '(,=:[!&|?{};+-*%<>~^', $prev_sig ) !== false ) {
-			return true;
-		}
-		if ( ctype_alnum( $prev_sig ) || $prev_sig === '_' || $prev_sig === '$' ) {
-			static $keywords = array(
-				'return', 'typeof', 'instanceof', 'in', 'of', 'new', 'delete',
-				'void', 'throw', 'else', 'do', 'yield', 'await', 'case',
-			);
-			return in_array( $word, $keywords, true );
-		}
-		return false;
-	}
 
 	/**
 	 * Maps a stylesheet URL back to an on-disk path. Returns false for
@@ -2035,13 +1937,12 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 	 * Builds (or reuses) the combined CSS file. Returns its public URL.
 	 */
 	private function build_combined_css_file( $items ) {
-		$uploads = wp_upload_dir();
-		if ( ! empty( $uploads['error'] ) ) {
+		$paths    = $this->combined_paths();
+		$dir      = $paths['path'];
+		$url_base = $paths['url'];
+		if ( $dir === '' ) {
 			return false;
 		}
-
-		$dir      = trailingslashit( $uploads['basedir'] ) . self::CACHE_SUBDIR;
-		$url_base = trailingslashit( $uploads['baseurl'] ) . self::CACHE_SUBDIR;
 
 		if ( ! wp_mkdir_p( $dir ) ) {
 			return false;
@@ -2082,7 +1983,7 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 			// file contains any imbalance to that file (an unclosed `/*` drops only
 			// the rest of THAT file, never the following stylesheets), so one bad
 			// stylesheet can't abort parsing for the entire merged file.
-			$css = $this->strip_css_comments( $css );
+			$css = FW_AO_Minifier::strip_css_comments( $css );
 
 			$css = preg_replace( '#@charset\s+[^;]+;\s*#i', '', $css );
 
@@ -2106,162 +2007,17 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 		}
 		$output .= $body;
 
-		$output = $this->minify_css( $output );
+		$output = FW_AO_Minifier::css( $output );
 
 		if ( file_put_contents( $filepath, $output, LOCK_EX ) === false ) {
 			return false;
 		}
 
-		$this->cleanup_old_files( $dir, $filename );
+		$this->maybe_gc( $dir, $filename );
 
 		return $fileurl;
 	}
 
-	/**
-	 * Strips CSS comments with a single-pass, string-aware scanner.
-	 *
-	 * Robust against malformed input (the whole point of using this instead of a
-	 * `/*...*\/` regex):
-	 *   - an UNCLOSED `/*` drops the remainder of the string (when run per source
-	 *     file this contains the damage to that one file, never the next);
-	 *   - a STRAY `*\/` with no opener is simply dropped (it would be invalid CSS
-	 *     and could otherwise abort the parser for everything after it);
-	 *   - string literals ('...' / "...") are copied verbatim, so a `/*` or `*\/`
-	 *     inside a value (e.g. content: "*\/") is never mistaken for a delimiter.
-	 *
-	 * @param string $css
-	 * @return string
-	 */
-	private function strip_css_comments( $css ) {
-		$len = strlen( $css );
-		$out = '';
-		$i   = 0;
-
-		while ( $i < $len ) {
-			$c  = $css[ $i ];
-			$c2 = $i + 1 < $len ? $css[ $i + 1 ] : '';
-
-			// Comment open: skip to the matching close, or to EOF if unclosed.
-			if ( $c === '/' && $c2 === '*' ) {
-				$end = strpos( $css, '*/', $i + 2 );
-				if ( $end === false ) {
-					break; // unclosed - drop the rest (contained to this file)
-				}
-				$i = $end + 2;
-				continue;
-			}
-
-			// Stray close delimiter (malformed source) - drop it.
-			if ( $c === '*' && $c2 === '/' ) {
-				$i += 2;
-				continue;
-			}
-
-			// String literal - copy verbatim so delimiters inside can't fool us.
-			if ( $c === '"' || $c === "'" ) {
-				$q    = $c;
-				$out .= $c;
-				$i++;
-				while ( $i < $len ) {
-					$ch = $css[ $i ];
-					if ( $ch === '\\' && $i + 1 < $len ) {
-						$out .= $ch . $css[ $i + 1 ];
-						$i   += 2;
-						continue;
-					}
-					$out .= $ch;
-					$i++;
-					if ( $ch === $q ) {
-						break;
-					}
-				}
-				continue;
-			}
-
-			$out .= $c;
-			$i++;
-		}
-
-		return $out;
-	}
-
-	/**
-	 * Lightweight CSS minifier for the combined output.
-	 *
-	 * Strips comments and collapses non-significant whitespace. Deliberately
-	 * conservative: it leaves spacing around value operators (`+ - * /` inside
-	 * calc(), combinators) and colons untouched so declarations and selectors
-	 * keep their meaning - the bulk of the savings comes from dropping the
-	 * newlines/indentation and comments between the merged stylesheets.
-	 */
-	private function minify_css( $css ) {
-		// Remove CSS comments with the string-aware scanner (same one used per
-		// source file). At this point only the balanced "/* ==== handle ==== */"
-		// markers remain, but using the scanner instead of a non-greedy regex
-		// keeps comment handling uniformly safe - a regex would mis-pair across
-		// the whole concatenated string if any stray delimiter slipped through.
-		$css = $this->strip_css_comments( $css );
-
-		// String-aware whitespace tightening. String literals are copied
-		// VERBATIM (so `content: "a: b"` keeps its exact text). Outside strings,
-		// each whitespace run is dropped entirely when it sits next to a
-		// character where CSS whitespace is insignificant, else collapsed to a
-		// single space. Deliberate asymmetries:
-		//   - space AFTER  `:` is removed (`margin: 0` -> `margin:0`) but space
-		//     BEFORE `:` is kept (`li :hover` = descendant + pseudo);
-		//   - space AFTER  `(` is removed but space BEFORE `(` is kept
-		//     (`@media screen and (min-width:…)` requires it);
-		//   - `+` and `~` are never touched (calc() / value math).
-		$len = strlen( $css );
-		$out = '';
-		$i   = 0;
-		while ( $i < $len ) {
-			$c = $css[ $i ];
-
-			if ( '"' === $c || "'" === $c ) { // string literal - copy verbatim
-				$q    = $c;
-				$out .= $c;
-				$i++;
-				while ( $i < $len ) {
-					$ch   = $css[ $i ];
-					$out .= $ch;
-					$i++;
-					if ( '\\' === $ch && $i < $len ) {
-						$out .= $css[ $i ];
-						$i++;
-						continue;
-					}
-					if ( $ch === $q ) {
-						break;
-					}
-				}
-				continue;
-			}
-
-			if ( false !== strpos( " \t\n\r\f", $c ) ) {
-				while ( $i < $len && false !== strpos( " \t\n\r\f", $css[ $i ] ) ) {
-					$i++;
-				}
-				$prev = '' === $out ? '' : substr( $out, -1 );
-				$next = $i < $len ? $css[ $i ] : '';
-				if ( '' === $prev || '' === $next
-					|| false !== strpos( '{};,>:(', $prev )
-					|| false !== strpos( '{};,>)', $next ) ) {
-					continue; // insignificant - drop the whitespace entirely
-				}
-				$out .= ' ';
-				continue;
-			}
-
-			$out .= $c;
-			$i++;
-		}
-
-		// Remove the now-redundant final semicolon before a closing brace.
-		$out = str_replace( ';}', '}', $out );
-
-		return trim( $out );
-	}
 
 	/**
 	 * Rewrites relative url(...) references to be absolute against the
@@ -2315,6 +2071,22 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 		}
 
 		return $scheme . $host . $port . '/' . implode( '/', $resolved ) . $tail;
+	}
+
+	/**
+	 * Throttled entry point for the age-based GC. cleanup_old_files() globs the
+	 * ENTIRE cache directory (O(files)) and stats every file, so running it on
+	 * every single cache write is wasteful once a per-page cache holds thousands
+	 * of files. Run it only occasionally (~1 in 50 writes). The file just written
+	 * is always preserved (cleanup_old_files skips $keep), and the 7-day TTL means
+	 * skipping most sweeps merely delays reclaiming already-stale files - never
+	 * the current one - so the cache stays bounded without a per-write scan.
+	 */
+	private function maybe_gc( $dir, $keep ) {
+		$roll = function_exists( 'wp_rand' ) ? wp_rand( 1, 50 ) : mt_rand( 1, 50 );
+		if ( 1 === $roll ) {
+			$this->cleanup_old_files( $dir, $keep );
+		}
 	}
 
 	private function cleanup_old_files( $dir, $keep ) {

@@ -5,6 +5,14 @@
 /**
  * Changelog ----------------------------------------------------------------
  *
+ * 1.1.33 - "CSS combining scope" now defaults to Per-page (was Site-wide).
+ *          Each page combines only the stylesheets it actually enqueues into its
+ *          own file, so pages stop shipping CSS they don't use - the big win on
+ *          Lighthouse / GTmetrix "reduce unused CSS". Site-wide (one shared
+ *          bundle) is still available and an explicit saved "site" still wins, so
+ *          anyone who chose it keeps it. Per-page is now the FIRST dropdown
+ *          choice. (JavaScript was already per-page.)
+ *
  * 1.1.29 - "Minify combined script" now defaults ON. The conservative JS
  *          minifier (string/template/regex-aware, preserves line breaks) runs on
  *          the combined bundle out of the box so it isn't flagged as unminified;
@@ -110,7 +118,7 @@ $manifest['description'] = __(
 	'fw'
 );
 
-$manifest['version']    = '1.1.32';
+$manifest['version']    = '1.1.37';
 $manifest['github_update'] = 'UnysonPlus/UnysonPlus-Asset-Optimizer-Extension';
 $manifest['display']    = true;
 $manifest['standalone'] = true;
