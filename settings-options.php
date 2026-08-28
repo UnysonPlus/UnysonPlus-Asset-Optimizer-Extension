@@ -93,6 +93,7 @@ if ( empty( $js_choices ) ) {
 }
 
 $options = array(
+	/** Filters options inserted before the asset-optimizer settings tabs so extensions can prepend their own settings fields. */
 	apply_filters( 'fw:ext:asset-optimizer:settings-options:before', array() ),
 
 	'tab_general' => array(
@@ -228,5 +229,6 @@ $options = array(
 		),
 	),
 
+	/** Filters options appended after the asset-optimizer settings tabs so extensions can add their own settings fields. */
 	apply_filters( 'fw:ext:asset-optimizer:settings-options:after', array() ),
 );

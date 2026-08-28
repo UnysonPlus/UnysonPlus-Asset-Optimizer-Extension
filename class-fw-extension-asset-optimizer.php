@@ -1087,6 +1087,7 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 	private function is_preset_css_handle( $handle ) {
 		static $handles = null;
 		if ( null === $handles ) {
+			/** Filters the handles treated as UnysonPlus design-preset stylesheets in the cascade (default the presets handle). */
 			$handles = (array) apply_filters(
 				'fw:ext:asset-optimizer:preset_css_handles',
 				array( 'unysonplus-presets' )
@@ -1312,6 +1313,8 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 		}
 
 		/**
+		 * Filters the list of CSS handles force-excluded from combining, a developer escape hatch given the known handle map.
+		 *
 		 * Force-exclude CSS handles from combining (developer escape hatch).
 		 *
 		 * @param string[] $handles Extra handles to leave as separate requests.
@@ -1556,6 +1559,8 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 		$defer     = ! empty( $store['js_defer'] );
 
 		/**
+		 * Filters the list of JS handles that must never be folded into the combined bundle.
+		 *
 		 * Force-exclude JS handles from combining (developer escape hatch).
 		 *
 		 * @param string[] $handles Handles to never fold into the bundle.
