@@ -361,6 +361,11 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 		</div>
 
 		<style>
+		/* Harden our tab strip against themes/plugins that globally restyle the shared
+		   `.nav-tab-wrapper` class in wp-admin (e.g. a Blockskit theme's theme-info.css
+		   centres it on a tinted flex bar). Scoped high enough to outrank a `.wrap h2.nav-tab-wrapper`
+		   rule, so our tabs stay left-aligned with the native underline regardless of the active theme. */
+		.fw-ext-asset-optimizer .fw-ao-tabs.nav-tab-wrapper{justify-content:flex-start;background:none;border-bottom:1px solid #c3c4c7}
 		.fw-ext-asset-optimizer .nav-tab{border-radius:.25rem .25rem 0 0}
 		.fw-ext-asset-optimizer .fw-ao-panel{display:none}
 		.fw-ext-asset-optimizer .fw-ao-panel.is-active{display:block}
