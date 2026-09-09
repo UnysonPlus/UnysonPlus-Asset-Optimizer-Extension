@@ -1995,6 +1995,14 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 			// stylesheet can't abort parsing for the entire merged file.
 			$css = FW_AO_Minifier::strip_css_comments( $css );
 
+			// Contain a source that ends with an OPEN string or brace (e.g. a
+			// corrupt `url("data:…` value with no closing quote). Without this the
+			// dangling quote makes the final css() string scanner swallow across
+			// the file boundary and drop every following block (a real bug: a dark
+			// site's `:root{--site-bg-color:…}` vanished this way). Balanced files
+			// are returned byte-for-byte unchanged, so valid combines are identical.
+			$css = FW_AO_Minifier::close_unbalanced( $css );
+
 			$css = preg_replace( '#@charset\s+[^;]+;\s*#i', '', $css );
 
 			$css = $this->rewrite_urls( $css, $item['src'] );

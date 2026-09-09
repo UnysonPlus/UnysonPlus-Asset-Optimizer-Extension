@@ -281,6 +281,117 @@ class FW_AO_Minifier {
 	}
 
 	/**
+	 * Neutralises a per-source stylesheet whose string / comment / bracket state is
+	 * left OPEN at EOF, so a single malformed source can't corrupt the whole
+	 * combined file.
+	 *
+	 * Rationale: strip_css_comments() contains an unclosed COMMENT to its own file
+	 * (it drops the rest), but it copies string literals VERBATIM and never tracks
+	 * brackets - so a source that ends with an unterminated string OR an unbalanced
+	 * `(` / `[` / `{` leaks into whatever follows. The real-world trigger is a
+	 * corrupt data-URI value such as
+	 *   background-image:url("data:image/svg+xml;transform:matrix(1,0,0,1,0,0);…
+	 * with no closing quote or paren. A browser's CSS tokenizer requires `()[]{}`
+	 * to nest and balance: an open `(` keeps consuming tokens (including `{` and
+	 * `}`) until its matching `)`, so a single dangling `(` swallows every FOLLOWING
+	 * rule - including the theme's `:root{--site-bg-color:…}` - and the page renders
+	 * with the default (white) background. Tracking only braces is not enough; the
+	 * unclosed PAREN is what desynced the parser.
+	 *
+	 * This scanner mirrors the CSS token grammar closely enough to contain damage:
+	 * it tracks strings (with `\` escapes), block comments, and a STACK of open
+	 * `{` / `(` / `[` delimiters, and it honours `\` escapes OUTSIDE strings too
+	 * (so an escaped `\[` in a selector like `.pt-lg-\[80px\]` is NOT counted as a
+	 * bracket). At EOF it appends the minimum needed to close what the file left
+	 * open: the dangling quote first, then each open delimiter's mate in LIFO order.
+	 *
+	 * For WELL-FORMED input (every string / comment / bracket balanced) it appends
+	 * nothing and returns the input byte-for-byte unchanged - so the combine stays
+	 * identical for every valid stylesheet; only a genuinely broken source is
+	 * contained (its trailing malformed run is folded into a single value, and the
+	 * following stylesheets parse cleanly).
+	 *
+	 * @param string $css
+	 * @return string
+	 */
+	public static function close_unbalanced( $css ) {
+		$len   = strlen( $css );
+		$i     = 0;
+		$stack = array();  // open delimiters: '{', '(', '['
+		$instr = false;    // false, or the open quote char (" or ')
+
+		$close = array(
+			'{' => '}',
+			'(' => ')',
+			'[' => ']',
+		);
+
+		while ( $i < $len ) {
+			$c  = $css[ $i ];
+			$c2 = $i + 1 < $len ? $css[ $i + 1 ] : '';
+
+			if ( false !== $instr ) {
+				if ( '\\' === $c && $i + 1 < $len ) {
+					$i += 2;
+					continue;
+				}
+				if ( $c === $instr ) {
+					$instr = false;
+				}
+				$i++;
+				continue;
+			}
+
+			// A backslash outside a string escapes the next char (CSS ident/selector
+			// escapes such as `\[`), so it can't open or close a bracket.
+			if ( '\\' === $c && $i + 1 < $len ) {
+				$i += 2;
+				continue;
+			}
+
+			// Skip comments (semantics mirror strip_css_comments; an unclosed one
+			// runs to EOF and the loop ends inside it, contributing nothing).
+			if ( '/' === $c && '*' === $c2 ) {
+				$end = strpos( $css, '*/', $i + 2 );
+				if ( false === $end ) {
+					break;
+				}
+				$i = $end + 2;
+				continue;
+			}
+
+			if ( '"' === $c || "'" === $c ) {
+				$instr = $c;
+				$i++;
+				continue;
+			}
+
+			if ( '{' === $c || '(' === $c || '[' === $c ) {
+				$stack[] = $c;
+			} elseif ( '}' === $c || ')' === $c || ']' === $c ) {
+				// Pop only if it matches the top; an unmatched closer (stray, no
+				// opener) is left as-is - harmless and preserves byte-identity.
+				$top = end( $stack );
+				if ( false !== $top && $close[ $top ] === $c ) {
+					array_pop( $stack );
+				}
+			}
+			$i++;
+		}
+
+		$suffix = '';
+		if ( false !== $instr ) {
+			$suffix .= $instr; // terminate the dangling string
+		}
+		// Close still-open delimiters in LIFO order (innermost first).
+		for ( $s = count( $stack ) - 1; $s >= 0; $s-- ) {
+			$suffix .= $close[ $stack[ $s ] ];
+		}
+
+		return '' === $suffix ? $css : $css . $suffix;
+	}
+
+	/**
 	 * Lightweight CSS minifier for the combined output.
 	 *
 	 * Strips comments and collapses non-significant whitespace. Deliberately
