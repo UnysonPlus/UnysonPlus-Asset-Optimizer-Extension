@@ -5,6 +5,25 @@
 /**
  * Changelog ----------------------------------------------------------------
  *
+ * 1.1.42 - "Serve WebP images" switch on the General tab (off by default).
+ *          Every uploaded JPG / PNG, each of its generated sizes and each
+ *          responsive crop from fw_image_crop_renditions() gets a WebP copy
+ *          beside it, and front-end image URLs (attachment images, srcsets,
+ *          images in post content, fw_image_tag crops) are swapped to the WebP
+ *          when it exists. Originals are never touched. Existing images are
+ *          converted gradually, a few per page view; a WebP that comes out
+ *          larger than its source is dropped and marked so it isn't retried.
+ *          Quality: fw:ext:asset-optimizer:webp_quality (default 80).
+ *
+ * 1.1.41 - "CSS delivery" option on the General tab. Linked file (default,
+ *          unchanged) or Inline: the combined CSS is printed in a style tag in
+ *          the page head instead of a separate stylesheet, so first paint no
+ *          longer waits on a second request (the Lighthouse "render-blocking
+ *          requests" insight). A bundle over 50 KB gzipped always stays a
+ *          linked file; raise or lower the cap with the
+ *          fw:ext:asset-optimizer:css_inline_max_bytes filter. The compressed
+ *          size is measured once per bundle and cached.
+ *
  * 1.1.33 - "CSS combining scope" now defaults to Per-page (was Site-wide).
  *          Each page combines only the stylesheets it actually enqueues into its
  *          own file, so pages stop shipping CSS they don't use - the big win on
@@ -118,7 +137,7 @@ $manifest['description'] = __(
 	'fw'
 );
 
-$manifest['version']    = '1.1.40';
+$manifest['version']    = '1.1.49';
 $manifest['github_update'] = 'UnysonPlus/UnysonPlus-Asset-Optimizer-Extension';
 $manifest['display']    = true;
 $manifest['standalone'] = true;

@@ -4,6 +4,8 @@
 
 // Standalone, dependency-free CSS/JS minifiers (extracted for testability).
 require_once __DIR__ . '/includes/class-fw-ao-minifier.php';
+require_once __DIR__ . '/includes/class-fw-ao-webp.php';
+require_once __DIR__ . '/includes/class-fw-ao-purger.php';
 
 class FW_Extension_Asset_Optimizer extends FW_Extension {
 
@@ -14,6 +16,7 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 	const COMBINED_JS_HANDLE       = 'unysonplus-asset-optimizer-js';
 	const CACHE_SUBDIR             = 'unysonplus/asset-optimizer';
 	const DISCOVERY_QUERY_ARG      = 'fw_asset_optimizer_discover';
+	const NOPURGE_QUERY_ARG        = 'fw_ao_nopurge';
 	const DISCOVERY_TOKEN_PREFIX   = 'fw_ao_discover_';
 	const MIGRATION_OPTION         = 'fw_ext_asset_optimizer_migrated_v1';
 	const AUTOLOAD_FIX_OPTION      = 'fw_ext_asset_optimizer_autoload_v2';
@@ -74,17 +77,34 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 		add_action( 'admin_post_' . self::ACTION_RESCAN, array( $this, 'handle_rescan' ) );
 
 		if ( is_admin() ) {
-			// Dedicated settings page under the Unyson+ menu (in addition to the
-			// Extensions-manager "Settings" link). Registered before the early
-			// return below, which only skips the frontend combining hooks.
+			// Dedicated settings page under the Unyson+ menu. Registered before the
+			// early return below, which only skips the frontend combining hooks.
 			add_action( 'admin_menu', array( $this, '_action_admin_menu' ), 30 );
 			add_filter( 'fw_unysonplus_admin_submenu_order', array( $this, '_filter_submenu_order' ) );
+
+			// ONE settings URL, not two. The Extensions manager hands every
+			// extension that ships settings-options.php a generic settings screen
+			// at fw-extensions&sub-page=extension&extension=<name>. We also
+			// register our own page, which renders the SAME options plus the tab
+			// strip, cache stats and the Clear cache / Re-scan actions - so the
+			// generic one was a second, poorer door to the same room, and any
+			// settings-page work had to be done twice to keep them in step.
+			// Redirecting (rather than suppressing) keeps old bookmarks and the
+			// manager's own "Settings" link working, and lands them on the page
+			// that actually has the controls.
+			add_action( 'admin_init', array( $this, '_redirect_manager_settings_page' ) );
 
 			// When the Extensions-manager settings form saves our options, recompute
 			// the persisted CSS-exclusion list (the dedicated settings page does the
 			// same in _maybe_save_settings). Both entry points write to the same store,
 			// so both must keep the derived exclusion list in sync.
 			add_action( 'fw_extension_settings_form_saved:' . $this->get_name(), array( $this, '_after_manager_settings_saved' ) );
+		}
+
+		// Serve WebP images (opt-in). Registered in every context: copies are made on
+		// upload (admin / REST) and swapped in on the front end.
+		if ( ! empty( $this->general_setting( 'webp_images', false ) ) ) {
+			FW_AO_Webp::init();
 		}
 
 		if ( is_admin() || wp_doing_ajax() || ( defined( 'REST_REQUEST' ) && REST_REQUEST ) ) {
@@ -105,6 +125,20 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 		// live, dependency-resolved script list because JS execution order is
 		// significant.
 		add_action( 'wp_enqueue_scripts', array( $this, 'enqueue_combined_js' ), 99999 );
+
+		// Unused-CSS purging (opt-in). This has to run on the FINISHED page, not
+		// at enqueue time: the combined file is built at wp_enqueue_scripts:99999,
+		// long before the body renders, so at that point there is no DOM to scan.
+		// So we buffer the whole response, scan the rendered HTML for the classes
+		// and ids it actually contains, write a purged copy of the bundle keyed by
+		// that fingerprint, and rewrite the <link> href in the buffered HTML to
+		// point at it. First view of a given page shape generates the file; every
+		// later view is a cache hit and does no CSS work at all.
+		// One buffer, several passes. Purging and the LCP preload both need the
+		// finished HTML, so they share a single ob_start rather than nesting two.
+		if ( $this->purge_enabled() || $this->preload_lcp_enabled() ) {
+			add_action( 'template_redirect', array( $this, 'start_purge_buffer' ), 1 );
+		}
 
 		// Final safety net: at shutdown, remember every handle that was enqueued
 		// or printed during this request - including handles enqueued late by
@@ -175,6 +209,42 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 	/**
 	 * @internal
 	 */
+	/**
+	 * @internal
+	 * Send the Extensions-manager's generic settings screen for THIS extension to
+	 * our own settings page, so there is exactly one Asset Optimizer settings URL.
+	 *
+	 * Only the settings view is redirected: the manager's other sub-pages for this
+	 * extension (docs, activate/deactivate, install) are left alone, and so is
+	 * every other extension's settings screen.
+	 */
+	public function _redirect_manager_settings_page() {
+		if ( ! is_admin() || wp_doing_ajax() ) {
+			return;
+		}
+		if ( ! isset( $_GET['page'], $_GET['sub-page'], $_GET['extension'] ) ) {
+			return;
+		}
+		if ( 'fw-extensions' !== $_GET['page'] || 'extension' !== $_GET['sub-page'] ) {
+			return;
+		}
+		if ( $this->get_name() !== $_GET['extension'] ) {
+			return;
+		}
+		// The manager's per-extension view has a `docs` tab alongside `settings`;
+		// only the settings one duplicates our page.
+		$tab = isset( $_GET['tab'] ) ? $_GET['tab'] : 'settings';
+		if ( 'settings' !== $tab ) {
+			return;
+		}
+		if ( ! current_user_can( self::CAPABILITY ) ) {
+			return; // let the manager render its own permission error
+		}
+
+		wp_safe_redirect( self::get_page_url(), 302 );
+		exit;
+	}
+
 	public function _action_admin_menu() {
 		if ( ! current_user_can( self::CAPABILITY ) ) {
 			return;
@@ -371,6 +441,32 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 		.fw-ext-asset-optimizer .fw-ao-panel.is-active{display:block}
 		.fw-ext-asset-optimizer .fw-ao-url{color:#a7aaad;transition:color .12s ease}
 		.fw-ext-asset-optimizer label:hover .fw-ao-url{color:#50575e}
+
+		/* Grouped handle list. The toolbar sticks because with 250 handles the
+		   check-all / filter controls would otherwise scroll out of reach exactly
+		   when you need them. */
+		.fw-ext-asset-optimizer .fw-ao-groupbar{position:sticky;top:32px;z-index:5;display:flex;flex-wrap:wrap;gap:8px;align-items:center;
+			padding:8px 10px;margin:0 0 10px;background:#fff;border:1px solid #dcdcde;border-radius:4px}
+		.fw-ext-asset-optimizer .fw-ao-filter{min-width:240px;flex:1 1 240px}
+		.fw-ext-asset-optimizer .fw-ao-onlyunchecked{display:inline-flex;align-items:center;gap:4px;white-space:nowrap;color:#50575e}
+		.fw-ext-asset-optimizer .fw-ao-total{margin-left:auto;color:#646970;font-variant-numeric:tabular-nums;white-space:nowrap}
+
+		.fw-ext-asset-optimizer .fw-ao-group{margin:0 0 6px;border:1px solid #dcdcde;border-radius:4px;background:#fff}
+		.fw-ext-asset-optimizer .fw-ao-group>summary{display:flex;align-items:center;gap:8px;padding:8px 10px;cursor:pointer;
+			font-weight:600;color:#1d2327;list-style:none;user-select:none}
+		.fw-ext-asset-optimizer .fw-ao-group>summary::-webkit-details-marker{display:none}
+		/* Own caret, so it can sit after the checkbox rather than before it. */
+		.fw-ext-asset-optimizer .fw-ao-group>summary::after{content:"";margin-left:4px;width:0;height:0;
+			border-left:4px solid transparent;border-right:4px solid transparent;border-top:5px solid #787c82;transition:transform .12s ease}
+		.fw-ext-asset-optimizer .fw-ao-group[open]>summary::after{transform:rotate(180deg)}
+		.fw-ext-asset-optimizer .fw-ao-group>summary:hover{background:#f6f7f7}
+		.fw-ext-asset-optimizer .fw-ao-gname{flex:0 1 auto}
+		.fw-ext-asset-optimizer .fw-ao-gcount{margin-left:auto;font-weight:400;color:#646970;font-variant-numeric:tabular-nums}
+		/* A fully excluded group is de-emphasised, so a glance down the collapsed
+		   list shows what is NOT being combined without opening anything. */
+		.fw-ext-asset-optimizer .fw-ao-group--none>summary .fw-ao-gname{color:#8c8f94;font-weight:400}
+		.fw-ext-asset-optimizer .fw-ao-gbody{padding:4px 10px 10px 32px;border-top:1px solid #f0f0f1}
+		.fw-ext-asset-optimizer .fw-ao-gbody>div{padding:1px 0}
 		</style>
 		<script>
 		( function () {
@@ -405,6 +501,150 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 					label.replaceChild( span, node );
 					label.insertBefore( document.createTextNode( node.nodeValue.slice( 0, idx ) ), span );
 				} );
+			} );
+
+			/* ----------------------------------------------------------------
+			 * Group the handle checkboxes.
+			 *
+			 * A real site registers 250+ stylesheets. As one flat list that is
+			 * unusable: you cannot find a handle, you cannot tell framework CSS
+			 * from a third-party plugin's, and there is no way to act on a whole
+			 * category at once. So the rows are folded into collapsible groups
+			 * (the group comes from data-ao-group, set server-side from each
+			 * asset's PATH) with a tri-state parent checkbox, per-group counts,
+			 * a filter box and check-all / uncheck-all.
+			 *
+			 * Rows are MOVED, never re-sorted: the server emits them in the
+			 * combined file's cascade order, and that order is information.
+			 * Groups appear in the order their first handle appears, so the
+			 * page still reads top-to-bottom as the cascade does.
+			 *
+			 * This is progressive enhancement over the stock `checkboxes`
+			 * option type - the inputs, their names and the stored value are
+			 * untouched, so with JS off the list simply renders flat as before.
+			 * -------------------------------------------------------------- */
+			wrap.querySelectorAll( '.fw-option-type-checkboxes' ).forEach( function ( box ) {
+				var rows = Array.prototype.slice.call(
+					box.querySelectorAll( 'input[type=checkbox][data-ao-group]' )
+				).map( function ( input ) {
+					return { input: input, row: input.closest( 'div' ) };
+				} ).filter( function ( r ) { return r.row && r.row.parentNode === box; } );
+
+				if ( rows.length < 8 ) { return; } // short list reads fine as-is
+
+				// --- toolbar -------------------------------------------------
+				var bar = document.createElement( 'div' );
+				bar.className = 'fw-ao-groupbar';
+				bar.innerHTML =
+					'<input type="search" class="fw-ao-filter" placeholder="<?php echo esc_js( __( 'Filter handles or paths…', 'fw' ) ); ?>">' +
+					'<button type="button" class="button fw-ao-all"><?php echo esc_js( __( 'Check all', 'fw' ) ); ?></button>' +
+					'<button type="button" class="button fw-ao-none"><?php echo esc_js( __( 'Uncheck all', 'fw' ) ); ?></button>' +
+					'<label class="fw-ao-onlyunchecked"><input type="checkbox"> <?php echo esc_js( __( 'Only unchecked', 'fw' ) ); ?></label>' +
+					'<span class="fw-ao-total"></span>';
+				box.parentNode.insertBefore( bar, box );
+
+				// --- partition into groups, first-seen order ------------------
+				var order = [], groups = {};
+				rows.forEach( function ( r ) {
+					var key = r.input.getAttribute( 'data-ao-group' ) || 'other';
+					if ( ! groups[ key ] ) {
+						groups[ key ] = {
+							label: r.input.getAttribute( 'data-ao-group-label' ) || key,
+							rows: []
+						};
+						order.push( key );
+					}
+					groups[ key ].rows.push( r );
+				} );
+
+				order.forEach( function ( key ) {
+					var g   = groups[ key ];
+					var det = document.createElement( 'details' );
+					det.className = 'fw-ao-group';
+					var sum = document.createElement( 'summary' );
+					sum.innerHTML =
+						'<input type="checkbox" class="fw-ao-gcheck">' +
+						'<span class="fw-ao-gname"></span>' +
+						'<span class="fw-ao-gcount"></span>';
+					sum.querySelector( '.fw-ao-gname' ).textContent = g.label;
+					det.appendChild( sum );
+					var body = document.createElement( 'div' );
+					body.className = 'fw-ao-gbody';
+					g.rows.forEach( function ( r ) { body.appendChild( r.row ); } );
+					det.appendChild( body );
+					box.appendChild( det );
+					g.details = det;
+					g.parent  = sum.querySelector( '.fw-ao-gcheck' );
+					g.count   = sum.querySelector( '.fw-ao-gcount' );
+
+					// Clicking the parent box must not also open/close the group.
+					g.parent.addEventListener( 'click', function ( e ) { e.stopPropagation(); } );
+					g.parent.addEventListener( 'change', function () {
+						g.rows.forEach( function ( r ) {
+							if ( r.row.style.display === 'none' ) { return; } // respect the filter
+							r.input.checked = g.parent.checked;
+						} );
+						sync();
+					} );
+				} );
+
+				function sync() {
+					var total = 0, on = 0;
+					order.forEach( function ( key ) {
+						var g = groups[ key ], gOn = 0, gTotal = 0;
+						g.rows.forEach( function ( r ) {
+							gTotal++;
+							if ( r.input.checked ) { gOn++; }
+						} );
+						total += gTotal; on += gOn;
+						g.parent.checked       = gOn === gTotal && gTotal > 0;
+						g.parent.indeterminate = gOn > 0 && gOn < gTotal;
+						g.count.textContent    = gOn + ' / ' + gTotal;
+						g.details.classList.toggle( 'fw-ao-group--none', gOn === 0 );
+					} );
+					bar.querySelector( '.fw-ao-total' ).textContent =
+						on + ' / ' + total + ' <?php echo esc_js( __( 'combined', 'fw' ) ); ?>';
+				}
+
+				rows.forEach( function ( r ) {
+					r.input.addEventListener( 'change', sync );
+				} );
+
+				bar.querySelector( '.fw-ao-all' ).addEventListener( 'click', function () {
+					rows.forEach( function ( r ) {
+						if ( r.row.style.display !== 'none' ) { r.input.checked = true; }
+					} );
+					sync();
+				} );
+				bar.querySelector( '.fw-ao-none' ).addEventListener( 'click', function () {
+					rows.forEach( function ( r ) {
+						if ( r.row.style.display !== 'none' ) { r.input.checked = false; }
+					} );
+					sync();
+				} );
+
+				var onlyUnchecked = bar.querySelector( '.fw-ao-onlyunchecked input' );
+				function applyFilter() {
+					var q    = bar.querySelector( '.fw-ao-filter' ).value.trim().toLowerCase();
+					var only = onlyUnchecked.checked;
+					order.forEach( function ( key ) {
+						var g = groups[ key ], shown = 0;
+						g.rows.forEach( function ( r ) {
+							var hay = r.row.textContent.toLowerCase();
+							var ok  = ( ! q || hay.indexOf( q ) !== -1 ) && ( ! only || ! r.input.checked );
+							r.row.style.display = ok ? '' : 'none';
+							if ( ok ) { shown++; }
+						} );
+						g.details.style.display = shown ? '' : 'none';
+						// A search is only useful if it reveals what it found.
+						if ( ( q || only ) && shown ) { g.details.open = true; }
+						else if ( ! q && ! only ) { g.details.open = false; }
+					} );
+				}
+				bar.querySelector( '.fw-ao-filter' ).addEventListener( 'input', applyFilter );
+				onlyUnchecked.addEventListener( 'change', applyFilter );
+
+				sync();
 			} );
 		} )();
 		</script>
@@ -444,13 +684,18 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 		return $this->combined_paths()['path'];
 	}
 
+	/** Public URL of the cache directory, or '' if uploads is unavailable. */
+	private function cache_url() {
+		return $this->combined_paths()['url'];
+	}
+
 	/** Deletes every combined CSS/JS file in the cache directory. */
 	private function purge_cache_files() {
 		$dir = $this->cache_dir();
 		if ( $dir === '' ) {
 			return;
 		}
-		$files = glob( $dir . '/combined-*.{css,js}', GLOB_BRACE );
+		$files = glob( $dir . '/{combined,purged}-*.{css,js}', GLOB_BRACE );
 		if ( $files ) {
 			foreach ( $files as $f ) {
 				@unlink( $f );
@@ -471,6 +716,424 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 		$this->purge_cache_files();
 	}
 
+	/* ---------------------------------------------------------------------
+	 * Unused-CSS purging
+	 * ------------------------------------------------------------------- */
+
+	/**
+	 * Whether purging should run on this request.
+	 *
+	 * Deliberately narrow. Purging is only sound when we control the whole
+	 * stylesheet AND can rewrite the tag that points at it, which means CSS
+	 * combining must be on and delivery must be a linked file - with `inline`
+	 * delivery the bundle is already printed into the head before we see the
+	 * buffer. Admin, AJAX, REST, feeds and the discovery crawl are all excluded:
+	 * the crawl in particular must see the UNPURGED page, or it would learn a
+	 * handle list derived from an already-purged bundle.
+	 */
+	public function purge_enabled() {
+		if ( empty( $this->general_setting( 'purge_css', false ) ) ) {
+			return false;
+		}
+		if ( ! $this->should_combine( 'css' ) ) {
+			return false;
+		}
+		if ( 'file' !== $this->general_setting( 'css_delivery', 'file' ) ) {
+			return false;
+		}
+		if ( is_admin() || wp_doing_ajax() || ( defined( 'REST_REQUEST' ) && REST_REQUEST ) ) {
+			return false;
+		}
+		if ( isset( $_GET[ self::DISCOVERY_QUERY_ARG ] ) ) {
+			return false;
+		}
+		// Escape hatch: ?fw_ao_nopurge=1 serves the full bundle for one request.
+		// Needed to compare a purged page against an unpurged one (which is how
+		// you prove a rendering bug IS the purge rather than something else), and
+		// the first thing to try when a page looks wrong. It can only ever serve
+		// MORE css, never less, so it is safe to leave ungated.
+		if ( isset( $_GET[ self::NOPURGE_QUERY_ARG ] ) ) {
+			return false;
+		}
+		return true;
+	}
+
+	/**
+	 * The safelist: selectors that survive purging even when nothing in the
+	 * scanned DOM matches them.
+	 *
+	 * This exists because a static scan sees ONE moment of the page, and a great
+	 * deal of CSS is for moments it never sees - a menu opened, a row hovered, a
+	 * slider initialised, an element scrolled into view. Measured on a real page:
+	 * purging with no safelist destroyed 111 of 120 hover rules, every
+	 * [aria-expanded] rule and 78 of 79 state rules named .is-... or .has-..., and a
+	 * screenshot of the result still looked perfect. The list below is the
+	 * validated default; users can add to it, and the filter lets a theme or
+	 * extension register its own conventions.
+	 *
+	 * @return string[] Full preg patterns.
+	 */
+	public function get_purge_safelist() {
+		$patterns = FW_AO_Purger::default_safelist();
+
+		// User additions: one pattern per line, plain substrings or /regex/.
+		$raw = (string) $this->general_setting( 'purge_safelist', '' );
+		foreach ( preg_split( '#[\r\n]+#', $raw ) as $line ) {
+			$line = trim( $line );
+			if ( '' === $line ) {
+				continue;
+			}
+			if ( strlen( $line ) > 2 && '/' === $line[0] && '/' === substr( $line, -1 ) ) {
+				$patterns[] = '~' . str_replace( '~', '\~', substr( $line, 1, -1 ) ) . '~';
+			} else {
+				$patterns[] = '~' . preg_quote( $line, '~' ) . '~';
+			}
+		}
+
+		/**
+		 * Filter the purge safelist.
+		 *
+		 * @param string[] $patterns Full preg patterns.
+		 */
+		return apply_filters( 'fw:ext:asset-optimizer:purge_safelist', $patterns );
+	}
+
+	/**
+	 * Start buffering the page so the rendered HTML can be scanned.
+	 *
+	 * @internal
+	 */
+	public function start_purge_buffer() {
+		ob_start( array( $this, 'filter_buffer' ) );
+	}
+
+	/**
+	 * Run every output-buffer pass that needs the finished page.
+	 *
+	 * @internal
+	 * @param string $html
+	 * @return string
+	 */
+	public function filter_buffer( $html ) {
+		if ( ! is_string( $html ) || strlen( $html ) < 200 || false === stripos( $html, '</html>' ) ) {
+			return $html; // not a full document (a REST / partial response)
+		}
+		if ( $this->purge_enabled() ) {
+			$html = $this->purge_buffer( $html );
+		}
+		if ( $this->preload_lcp_enabled() ) {
+			$html = $this->preload_lcp_image( $html );
+		}
+		return $html;
+	}
+
+	/**
+	 * Purge the combined stylesheet against the finished page, then point the
+	 * page's <link> at the purged copy.
+	 *
+	 * Every failure path returns the HTML UNCHANGED. A purge that cannot be
+	 * completed must degrade to the full bundle, never to a broken page.
+	 *
+	 * @internal
+	 * @param string $html
+	 * @return string
+	 */
+	public function purge_buffer( $html ) {
+		try {
+			if ( ! is_string( $html ) || strlen( $html ) < 200 || false === stripos( $html, '</html>' ) ) {
+				return $html; // not a full document (a REST/partial response)
+			}
+
+			// Find the combined stylesheet this page actually printed.
+			if ( ! preg_match( '#<link[^>]+href=([\'"])([^\'"]*?/' . preg_quote( self::CACHE_SUBDIR, '#' ) . '/combined-[a-f0-9]+\.css)\1#i', $html, $m ) ) {
+				return $html;
+			}
+			$url  = $m[2];
+			$path = $this->url_to_path( $url );
+			if ( ! $path || ! is_readable( $path ) ) {
+				return $html;
+			}
+
+			$tokens = FW_AO_Purger::collect_tokens( $html );
+			if ( empty( $tokens['classes'] ) && empty( $tokens['ids'] ) ) {
+				return $html; // nothing learned - refuse to purge blind
+			}
+
+			// Cache key: the bundle + what the page contains + the safelist. Any
+			// of the three changing must produce a different file.
+			$safelist = $this->get_purge_safelist();
+			$key      = substr( md5(
+				basename( $path ) . '|' .
+				md5( implode( ',', array_keys( $tokens['classes'] ) ) . '|' . implode( ',', array_keys( $tokens['ids'] ) ) ) . '|' .
+				md5( implode( '|', $safelist ) ) . '|' .
+				(string) filemtime( $path )
+			), 0, 12 );
+
+			$dir       = $this->cache_dir();
+			$file      = 'purged-' . $key . '.css';
+			$dest      = trailingslashit( $dir ) . $file;
+			$dest_url  = trailingslashit( $this->cache_url() ) . $file;
+
+			if ( ! file_exists( $dest ) ) {
+				$css = file_get_contents( $path );
+				if ( false === $css || '' === $css ) {
+					return $html;
+				}
+				$purged = FW_AO_Purger::purge( $css, $tokens, $safelist );
+
+				// A purge that removed almost everything means the scan failed to
+				// understand the page, not that the page needs no CSS. Bail rather
+				// than serve a stylesheet that would render the site unstyled.
+				if ( '' === trim( $purged ) || strlen( $purged ) < ( strlen( $css ) * 0.02 ) ) {
+					return $html;
+				}
+				if ( ! wp_mkdir_p( $dir ) ) {
+					return $html;
+				}
+				$this->ensure_cache_headers( $dir );
+				if ( false === file_put_contents( $dest, $purged, LOCK_EX ) ) {
+					return $html;
+				}
+			}
+
+			$html = str_replace( $url, $dest_url, $html );
+
+			// WordPress's inline block/theme.json CSS never reaches the combiner
+			// (it is a <style> block, not a handle with a src), so purge it here.
+			return $this->purge_inline_styles( $html, $tokens, $safelist );
+		} catch ( Exception $e ) {
+			return $html;
+		} catch ( Error $e ) {
+			return $html;   // PHP 7+ internal errors must not take the page down
+		}
+	}
+
+	/**
+	 * Drop an .htaccess into the cache directory so the generated files are
+	 * cached for a year instead of revalidated on every visit.
+	 *
+	 * Measured before this existed: the combined CSS and JS came back with NO
+	 * cache header at all, so a returning visitor re-requested both every time.
+	 * Caching them forever is safe by construction, not by optimism - every
+	 * filename contains a hash of its contents, so a rebuild is a different URL
+	 * and a stale file can never be served.
+	 *
+	 * Apache only. On nginx/LiteSpeed the file is inert and the rules belong in
+	 * the server config; the same one-year policy applies there.
+	 */
+	private function ensure_cache_headers( $dir ) {
+		if ( '' === $dir || ! is_dir( $dir ) ) {
+			return;
+		}
+		$file = trailingslashit( $dir ) . '.htaccess';
+		if ( file_exists( $file ) ) {
+			return;
+		}
+		$rules = "# Generated by the UnysonPlus Asset Optimizer - safe to delete, it is recreated.\n"
+			. "# Every filename here contains a hash of the file's contents, so a rebuild\n"
+			. "# produces a new URL and these can be cached indefinitely.\n"
+			. "<IfModule mod_headers.c>\n"
+			. "\t<FilesMatch \"\\.(css|js)$\">\n"
+			. "\t\tHeader set Cache-Control \"public, max-age=31536000, immutable\"\n"
+			. "\t</FilesMatch>\n"
+			. "</IfModule>\n"
+			. "<IfModule mod_expires.c>\n"
+			. "\tExpiresActive On\n"
+			. "\tExpiresByType text/css \"access plus 1 year\"\n"
+			. "\tExpiresByType application/javascript \"access plus 1 year\"\n"
+			. "</IfModule>\n";
+		@file_put_contents( $file, $rules );
+	}
+
+	/**
+	 * WordPress prints these stylesheets INLINE, which puts them out of reach of
+	 * both the combiner and the purger - they are not handles with a src, they
+	 * are <style> blocks in the head. On a page built with the page builder
+	 * rather than blocks, `global-styles-inline-css` alone measured 23,883 bytes
+	 * with 75% of it unmatched.
+	 *
+	 * Only WordPress's own block/theme.json output is touched. The plugin's and
+	 * theme's own inline styles (preset CSS, header/footer custom CSS) are left
+	 * alone: they are generated FROM the site's settings, so they are already
+	 * exactly what the site asked for - measured 0% unused.
+	 *
+	 * @return string[]
+	 */
+	private function purgeable_inline_style_ids() {
+		return apply_filters( 'fw:ext:asset-optimizer:purgeable_inline_style_ids', array(
+			'global-styles-inline-css',
+			'wp-block-library-inline-css',
+			'classic-theme-styles-inline-css',
+		) );
+	}
+
+	/**
+	 * Purge the WordPress core inline <style> blocks in place.
+	 *
+	 * @param string $html
+	 * @param array  $tokens
+	 * @param array  $safelist
+	 * @return string
+	 */
+	private function purge_inline_styles( $html, array $tokens, array $safelist ) {
+		foreach ( $this->purgeable_inline_style_ids() as $id ) {
+			$html = preg_replace_callback(
+				'#(<style[^>]*\bid=([\'"])' . preg_quote( $id, '#' ) . '\2[^>]*>)(.*?)(</style>)#is',
+				function ( $m ) use ( $tokens, $safelist ) {
+					$purged = FW_AO_Purger::purge( $m[3], $tokens, $safelist );
+					// Same guard as the file pass: a near-total wipe means the
+					// scan failed, not that the page needs no CSS.
+					if ( '' === trim( $purged ) || strlen( $purged ) < ( strlen( $m[3] ) * 0.02 ) ) {
+						return $m[0];
+					}
+					return $m[1] . $purged . $m[4];
+				},
+				$html
+			);
+		}
+		return $html;
+	}
+
+	/* ---------------------------------------------------------------------
+	 * LCP image preload
+	 * ------------------------------------------------------------------- */
+
+	/** Whether to emit a preload for the page's likely LCP image. */
+	public function preload_lcp_enabled() {
+		if ( empty( $this->general_setting( 'preload_lcp_image', false ) ) ) {
+			return false;
+		}
+		if ( is_admin() || wp_doing_ajax() || ( defined( 'REST_REQUEST' ) && REST_REQUEST ) ) {
+			return false;
+		}
+		return true;
+	}
+
+	/**
+	 * Tell the browser about the hero image before it has parsed the CSS.
+	 *
+	 * This is not a bytes optimisation - it is a discovery-order one, and on the
+	 * measured site it is the largest user-visible win available: LCP was 3.9s
+	 * live, on an image the browser cannot find until it has downloaded the
+	 * stylesheet, built the layout and reached that element.
+	 *
+	 * The hero is taken to be the first <img> that is NOT lazy-loaded, which is
+	 * what WordPress's own above-the-fold heuristic produces (core omits
+	 * loading="lazy" from the first in-content image for the same reason). If a
+	 * page has none, nothing is emitted - a wrong guess would cost a wasted
+	 * download, so the rule stays narrow.
+	 *
+	 * @internal
+	 * @param string $html
+	 * @return string
+	 */
+	public function preload_lcp_image( $html ) {
+		try {
+			if ( false !== stripos( $html, 'rel="preload" as="image"' ) ) {
+				return $html; // something already preloads an image; don't compete
+			}
+			$body = stripos( $html, '<body' );
+			if ( false === $body ) {
+				return $html;
+			}
+
+			// Start AFTER the site header. "First non-lazy image" sounds like the
+			// hero and is not: on the measured page it selected the 40px logo
+			// while the actual LCP element was a large illustration further down
+			// the first screen. Preloading the logo spends the browser's early
+			// bandwidth on something it was going to fetch anyway and leaves the
+			// real LCP exactly as late as before.
+			$start = $body;
+			$hdr   = stripos( $html, '</header>', $body );
+			if ( false !== $hdr ) {
+				$start = $hdr;
+			}
+
+			if ( ! preg_match_all( '#<img\b[^>]*>#i', substr( $html, $start ), $imgs ) ) {
+				return $html;
+			}
+
+			// Only the first few content images are candidates. Beyond that we are
+			// guessing at something below the fold, and eagerly loading it would
+			// cost bandwidth to no benefit.
+			$candidates = array_slice( $imgs[0], 0, 3 );
+
+			$hero = '';
+			foreach ( $candidates as $tag ) {
+				// NOTE: a lazy image is NOT skipped here, which looks wrong and is
+				// the whole point. On the measured page the LCP element itself
+				// carried loading="lazy" - the page builder marks every image lazy,
+				// including the one in the hero - so the browser was deliberately
+				// deferring the exact element that defines the LCP. Skipping lazy
+				// images found nothing to preload and left that bug in place. The
+				// hero's lazy attribute is removed below.
+				//
+				// Chrome ignores an LCP candidate smaller than a few thousand
+				// square pixels, so anything declaring itself tiny is not it.
+				if ( preg_match( '#\bwidth\s*=\s*([\'"])(\d+)\1#i', $tag, $w ) && (int) $w[2] < 150 ) {
+					continue;
+				}
+				if ( preg_match( '#\bheight\s*=\s*([\'"])(\d+)\1#i', $tag, $h ) && (int) $h[2] < 150 ) {
+					continue;
+				}
+				// Logos, icons and tracking pixels are never the LCP.
+				if ( preg_match( '#\b(class|id)\s*=\s*([\'"])[^\'"]*\b(logo|icon|avatar|badge|pixel|spinner)\b#i', $tag ) ) {
+					continue;
+				}
+				if ( ! preg_match( '#\bsrc\s*=\s*([\'"])(.*?)\1#i', $tag ) ) {
+					continue;
+				}
+				$hero = $tag;
+				break;
+			}
+			if ( '' === $hero ) {
+				return $html;
+			}
+
+			preg_match( '#\bsrc\s*=\s*([\'"])(.*?)\1#i', $hero, $m );
+			$src = $m[2];
+			if ( '' === $src || 0 === stripos( $src, 'data:' ) ) {
+				return $html;
+			}
+			$srcset = preg_match( '#\bsrcset\s*=\s*([\'"])(.*?)\1#i', $hero, $m2 ) ? $m2[2] : '';
+			$sizes  = preg_match( '#\bsizes\s*=\s*([\'"])(.*?)\1#i', $hero, $m3 ) ? $m3[2] : '';
+
+			$link = '<link rel="preload" as="image" href="' . esc_url( $src ) . '"'
+				. ( $srcset ? ' imagesrcset="' . esc_attr( $srcset ) . '"' : '' )
+				. ( $sizes ? ' imagesizes="' . esc_attr( $sizes ) . '"' : '' )
+				. ' fetchpriority="high">';
+
+			// Rewrite the hero tag itself:
+			//   - drop loading="lazy" (preloading an image the browser has been
+			//     told to defer is self-defeating - the two directives fight and
+			//     the browser warns about it in the console),
+			//   - add fetchpriority="high" so it stays ahead of the other images
+			//     once discovered.
+			// The preload sets priority for the FETCH; these keep it for the
+			// ELEMENT. Neither half is much use without the other.
+			$new_hero = preg_replace( '#\s*\bloading\s*=\s*([\'"])lazy\1#i', '', $hero );
+			if ( ! preg_match( '#\bfetchpriority\s*=#i', $new_hero ) ) {
+				$new_hero = preg_replace( '#<img\b#i', '<img fetchpriority="high"', $new_hero, 1 );
+			}
+			if ( $new_hero !== $hero ) {
+				$pos = strpos( $html, $hero, $start );
+				if ( false !== $pos ) {
+					$html = substr_replace( $html, $new_hero, $pos, strlen( $hero ) );
+				}
+			}
+
+			$head = stripos( $html, '</head>' );
+			if ( false === $head ) {
+				return $html;
+			}
+			return substr_replace( $html, $link . "\n", $head, 0 );
+		} catch ( Exception $e ) {
+			return $html;
+		} catch ( Error $e ) {
+			return $html;
+		}
+	}
+
 	/**
 	 * Cache stats for the settings page: number of combined files and their
 	 * total size in bytes.
@@ -482,7 +1145,7 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 		if ( $dir === '' ) {
 			return array( 'count' => 0, 'bytes' => 0 );
 		}
-		$files = glob( $dir . '/combined-*.{css,js}', GLOB_BRACE );
+		$files = glob( $dir . '/{combined,purged}-*.{css,js}', GLOB_BRACE );
 		$count = 0;
 		$bytes = 0;
 		if ( $files ) {
@@ -1045,8 +1708,61 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 			$this->absorbed_css_handles[ $handle ] = true;
 		}
 
+		// Inline delivery: print the bundle in a <style> in <head> instead of a <link>,
+		// so first paint doesn't wait on a second round trip. Same handle and cascade
+		// position either way; the cached file stays the source of truth. url()s are
+		// already absolute (rewrite_urls), so the CSS works unchanged inline.
+		$inline_css = $this->combined_css_inline_body( $combined_url );
+		if ( $inline_css !== '' ) {
+			wp_register_style( self::COMBINED_CSS_HANDLE, false, array(), null );
+			wp_enqueue_style( self::COMBINED_CSS_HANDLE );
+			wp_add_inline_style( self::COMBINED_CSS_HANDLE, $inline_css );
+			return;
+		}
+
 		wp_register_style( self::COMBINED_CSS_HANDLE, $combined_url, array(), null );
 		wp_enqueue_style( self::COMBINED_CSS_HANDLE );
+	}
+
+	/**
+	 * The combined CSS to print inline, or '' to keep the linked file: when
+	 * the CSS delivery setting is "inline", the file is readable, and its
+	 * COMPRESSED size (what actually travels) is within the cap - filter
+	 * fw:ext:asset-optimizer:css_inline_max_bytes, default 50 KB gzipped.
+	 * Inlining a big bundle into every HTML response costs more than the
+	 * request it saves. The measured size is cached per bundle file.
+	 *
+	 * @param string $combined_url Public URL of the combined file.
+	 * @return string
+	 */
+	private function combined_css_inline_body( $combined_url ) {
+		if ( 'inline' !== $this->general_setting( 'css_delivery', 'file' ) ) {
+			return '';
+		}
+		$path = $this->url_to_path( $combined_url );
+		if ( ! $path || ! is_readable( $path ) ) {
+			return '';
+		}
+		$css = (string) file_get_contents( $path );
+		if ( $css === '' ) {
+			return '';
+		}
+
+		$size_key = 'fw_ao_gz_' . md5( basename( $path ) );
+		$gz_size  = get_transient( $size_key );
+		if ( false === $gz_size ) {
+			$gz_size = function_exists( 'gzencode' ) ? strlen( gzencode( $css, 6 ) ) : (int) ( strlen( $css ) / 5 );
+			set_transient( $size_key, $gz_size, WEEK_IN_SECONDS );
+		}
+		$max = (int) apply_filters( 'fw:ext:asset-optimizer:css_inline_max_bytes', 51200 );
+		if ( (int) $gz_size > $max ) {
+			return '';
+		}
+
+		// @charset is only valid in a linked stylesheet; a closing style tag in a
+		// string or comment must not end the inline block early.
+		$css = preg_replace( '#^\s*@charset\s+[^;]+;\s*#i', '', $css );
+		return str_ireplace( '</style', '<\/style', $css );
 	}
 
 	/**
@@ -1824,6 +2540,7 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 		if ( ! wp_mkdir_p( $dir ) ) {
 			return false;
 		}
+		$this->ensure_cache_headers( $dir );
 
 		// The format token participates in the hash, so toggling minification
 		// invalidates previously cached bundles and forces a regeneration.
@@ -1957,6 +2674,7 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 		if ( ! wp_mkdir_p( $dir ) ) {
 			return false;
 		}
+		$this->ensure_cache_headers( $dir );
 
 		// 'fmt' token participates in the hash so changing the output format
 		// (e.g. enabling minification) invalidates previously cached files and
@@ -2108,7 +2826,7 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 	}
 
 	private function cleanup_old_files( $dir, $keep ) {
-		$files = glob( $dir . '/combined-*.{css,js}', GLOB_BRACE );
+		$files = glob( $dir . '/{combined,purged}-*.{css,js}', GLOB_BRACE );
 		if ( ! $files ) {
 			return;
 		}

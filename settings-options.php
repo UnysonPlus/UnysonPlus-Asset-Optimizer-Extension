@@ -37,7 +37,85 @@ if ( $ext && ! empty( $known_css ) ) {
 	$known_css = $reordered;
 }
 
+/**
+ * Which group a handle belongs to, as array( key, label ).
+ *
+ * A site can easily register 250+ stylesheets, and a flat list that long is
+ * unusable - you cannot find a handle in it, and you cannot tell the framework's
+ * own CSS from a third-party plugin's. Grouping is derived from the asset's PATH
+ * (which is what actually identifies its owner), never from the handle name,
+ * which plugins choose freely.
+ *
+ * The group ORDER below is deliberate: it mirrors the combined file's cascade,
+ * the same order prioritize_css_handles() puts the handles in - WordPress core,
+ * then the framework, then shortcodes, then extensions, then the themes, with
+ * the child theme last. Sorting the list alphabetically would read more tidily
+ * and would destroy that signal, so we group without re-sorting, and handles
+ * keep their cascade order inside each group.
+ *
+ * @param string $handle
+ * @param string $src
+ * @return array array( group_key, group_label )
+ */
+if ( ! function_exists( 'fw_ao_asset_group' ) ) {
+	function fw_ao_asset_group( $handle, $src ) {
+		$path = (string) preg_replace( '#^https?://[^/]+#i', '', (string) $src );
+
+		// Handles WordPress prints inline carry no src at all, so they are
+		// matched by name - the one place where the name is the only signal.
+		if ( $path === '' ) {
+			if ( preg_match( '#^(wp|core)[-_]#i', $handle ) || 'global-styles' === $handle ) {
+				return array( 'wp-core', __( 'WordPress core', 'fw' ) );
+			}
+			return array( 'other', __( 'Other / unknown', 'fw' ) );
+		}
+
+		if ( stripos( $path, '/wp-includes/' ) !== false || preg_match( '#^(wp|core)[-_]#i', $handle ) ) {
+			return array( 'wp-core', __( 'WordPress core', 'fw' ) );
+		}
+		// The Animation Engine's effect partials live under /css/animate/, NOT
+		// under a path containing "animation-engine". Their classes are applied
+		// by JS after load, which makes them the riskiest set on the page, so
+		// they get their own group rather than being scattered through the list.
+		if ( stripos( $path, '/css/animate/' ) !== false || stripos( $path, '/animation-engine/' ) !== false ) {
+			return array( 'animation', __( 'Animation effects', 'fw' ) );
+		}
+		if ( stripos( $path, '/extensions/shortcodes/shortcodes/' ) !== false ) {
+			return array( 'shortcodes', __( 'UnysonPlus — Shortcodes', 'fw' ) );
+		}
+		if ( preg_match( '#/framework/extensions/([^/]+)/#i', $path, $m ) ) {
+			$name = ucwords( str_replace( array( '-', '_' ), ' ', $m[1] ) );
+			return array( 'ext-' . sanitize_key( $m[1] ), sprintf( __( 'Extension: %s', 'fw' ), $name ) );
+		}
+		if ( stripos( $path, '/framework/' ) !== false ) {
+			return array( 'framework', __( 'UnysonPlus — Framework core', 'fw' ) );
+		}
+		if ( stripos( $path, '/uploads/unysonplus/' ) !== false ) {
+			return array( 'generated', __( 'Generated CSS (presets, dynamic)', 'fw' ) );
+		}
+
+		$parent = trailingslashit( wp_make_link_relative( get_template_directory_uri() ) );
+		$child  = trailingslashit( wp_make_link_relative( get_stylesheet_directory_uri() ) );
+		if ( $child !== $parent && strpos( $path, $child ) === 0 ) {
+			return array( 'child-theme', __( 'Child theme', 'fw' ) );
+		}
+		if ( strpos( $path, $parent ) === 0 ) {
+			return array( 'parent-theme', __( 'Parent theme', 'fw' ) );
+		}
+		if ( stripos( $path, '/themes/' ) !== false ) {
+			return array( 'theme-other', __( 'Other theme', 'fw' ) );
+		}
+		if ( preg_match( '#/plugins/([^/]+)/#i', $path, $m ) && 'unysonplus' !== $m[1] ) {
+			return array( 'plugin-other', __( 'Other plugins', 'fw' ) );
+		}
+		return array( 'other', __( 'Other / unknown', 'fw' ) );
+	}
+}
+
 // ---- CSS choices (all checked by default) ----
+// Each choice carries its group on the input as data-ao-group / data-ao-group-label.
+// The settings page's JS reads those to build the collapsible grouped UI; with JS
+// off the list still renders exactly as before, just flat.
 $css_choices  = array();
 $css_defaults = array();
 foreach ( $known_css as $handle => $src ) {
@@ -46,7 +124,15 @@ foreach ( $known_css as $handle => $src ) {
 		$short  = preg_replace( '#^https?://[^/]+#i', '', $src );
 		$label .= '  —  ' . $short;
 	}
-	$css_choices[ $handle ]  = $label;
+	list( $g_key, $g_label ) = fw_ao_asset_group( $handle, $src );
+
+	$css_choices[ $handle ]  = array(
+		'text' => $label,
+		'attr' => array(
+			'data-ao-group'       => $g_key,
+			'data-ao-group-label' => $g_label,
+		),
+	);
 	$css_defaults[ $handle ] = true;
 }
 
@@ -59,7 +145,14 @@ foreach ( $known_js as $handle => $src ) {
 		$short  = preg_replace( '#^https?://[^/]+#i', '', $src );
 		$label .= '  —  ' . $short;
 	}
-	$js_choices[ $handle ] = $label;
+	list( $g_key, $g_label ) = fw_ao_asset_group( $handle, $src );
+	$js_choices[ $handle ] = array(
+		'text' => $label,
+		'attr' => array(
+			'data-ao-group'       => $g_key,
+			'data-ao-group-label' => $g_label,
+		),
+	);
 	if ( ! isset( $js_defaults[ $handle ] ) ) {
 		$js_defaults[ $handle ] = false;
 	}
@@ -135,6 +228,41 @@ $options = array(
 									'site'     => __( 'Site-wide (one shared bundle)', 'fw' ),
 								),
 								'value'   => 'per_page',
+							),
+							'css_delivery' => array(
+								'type'    => 'select',
+								'label'   => __( 'CSS delivery', 'fw' ),
+								'desc'    => __( 'Linked file (default): the combined CSS loads as a separate cached file, which the browser must download before it can paint. Inline: the combined CSS is printed in a style tag in the page head instead, so the first paint no longer waits on a second request (fixes the “render-blocking requests” insight). Best for small sites where most visitors land on one page. A bundle larger than 50 KB compressed always stays a linked file.', 'fw' ),
+								'no-validate' => true,
+								'choices' => array(
+									'file'   => __( 'Linked file (default)', 'fw' ),
+									'inline' => __( 'Inline in the page head', 'fw' ),
+								),
+								'value'   => 'file',
+							),
+							'purge_css' => array(
+								'type'  => 'switch',
+								'label' => __( 'Remove unused CSS', 'fw' ),
+								'desc'  => __( 'Strip rules nothing on the page can use. A typical page uses under 15% of the CSS it downloads; on measured sites this halves the combined file. Each page gets its own purged copy, generated on its first view and cached afterwards. <strong>Off by default, and worth testing before you rely on it:</strong> a rule removed in error shows up as a wrong hover state or a broken menu rather than an error, so after switching it on, click through a few pages — open the menu, expand an accordion, hover the buttons. Anything that looks wrong can be protected with the safelist below. Requires <em>Combine CSS</em> on and <em>CSS delivery</em> set to a linked file.', 'fw' ),
+								'value' => false,
+							),
+							'purge_safelist' => array(
+								'type'  => 'textarea',
+								'label' => __( 'Never remove (safelist)', 'fw' ),
+								'desc'  => __( 'One entry per line: any selector containing the text is kept. Wrap in slashes for a regular expression, e.g. <code>/^\\.promo-/</code>. Common state classes (<code>is-</code>, <code>has-</code>, <code>active</code>, <code>open</code>…), all hover/focus rules, animation and slider classes, and the Animation Engine are already protected — add entries here only for class names your own code adds with JavaScript.', 'fw' ),
+								'value' => '',
+							),
+							'preload_lcp_image' => array(
+								'type'  => 'switch',
+								'label' => __( 'Preload the hero image', 'fw' ),
+								'desc'  => __( 'Tell the browser about the page\'s main image straight away, instead of leaving it to find it after the stylesheet has downloaded and the layout is built. This does not make anything smaller — it changes the <em>order</em> things are fetched, which is usually where a slow "largest contentful paint" actually comes from. The first image that is not lazy-loaded is treated as the hero; on a page that has none, nothing is added.', 'fw' ),
+								'value' => false,
+							),
+							'webp_images' => array(
+								'type'  => 'switch',
+								'label' => __( 'Serve WebP images', 'fw' ),
+								'desc'  => __( 'Make a WebP copy of every uploaded JPG / PNG (and each of its sizes and crops) and show visitors the WebP instead: usually 25–80% smaller for the same look. The originals are kept untouched, so turning this off simply goes back to them. Existing images are converted gradually as pages are viewed.', 'fw' ),
+								'value' => false,
 							),
 							'logged_out_only' => array(
 								'type'  => 'switch',
