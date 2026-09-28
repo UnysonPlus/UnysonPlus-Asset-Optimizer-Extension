@@ -137,7 +137,7 @@ $manifest['description'] = __(
 	'fw'
 );
 
-$manifest['version']    = '1.1.49';
+$manifest['version']    = '1.1.53';
 $manifest['github_update'] = 'UnysonPlus/UnysonPlus-Asset-Optimizer-Extension';
 $manifest['display']    = true;
 $manifest['standalone'] = true;

@@ -107,6 +107,24 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 			FW_AO_Webp::init();
 		}
 
+		// Encoder quality for the theme's generated image crops. The crop pipeline
+		// lives in core (framework/includes/image-crops.php) and defaults to 82 on
+		// its own; this only surfaces the knob in the settings UI. Registered in
+		// every context, because crops are generated on demand from wherever the
+		// image is first rendered.
+		add_filter( 'fw_image_crop_quality', array( $this, '_filter_image_crop_quality' ) );
+
+		// Keep the WebP encoder at the SAME quality as the source it is copying.
+		//
+		// These two were independent, and that made them fight: WebP was always
+		// written at 80 while a crop could be written at anything. Set Image
+		// quality to 55 and the q80 WebP came out LARGER than the q55 JPEG, so it
+		// was discarded and a `.nowebp` marker written - turning WebP delivery off
+		// for that image entirely, and permanently, which is the opposite of what
+		// asking for smaller images should do. At equal quality a WebP is
+		// reliably smaller than the JPEG, so tying them keeps the copy winning.
+		add_filter( 'fw:ext:asset-optimizer:webp_quality', array( $this, '_filter_image_crop_quality' ) );
+
 		if ( is_admin() || wp_doing_ajax() || ( defined( 'REST_REQUEST' ) && REST_REQUEST ) ) {
 			return;
 		}
@@ -738,9 +756,6 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 		if ( ! $this->should_combine( 'css' ) ) {
 			return false;
 		}
-		if ( 'file' !== $this->general_setting( 'css_delivery', 'file' ) ) {
-			return false;
-		}
 		if ( is_admin() || wp_doing_ajax() || ( defined( 'REST_REQUEST' ) && REST_REQUEST ) ) {
 			return false;
 		}
@@ -846,7 +861,13 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 
 			// Find the combined stylesheet this page actually printed.
 			if ( ! preg_match( '#<link[^>]+href=([\'"])([^\'"]*?/' . preg_quote( self::CACHE_SUBDIR, '#' ) . '/combined-[a-f0-9]+\.css)\1#i', $html, $m ) ) {
-				return $html;
+				// No <link> because the bundle was ALREADY inlined at enqueue time
+				// (css_delivery: inline, and the FULL bundle happened to fit under
+				// the cap). There is no file to rewrite, but the CSS is right here
+				// in the page - purge it where it sits. Without this branch, turning
+				// on both settings silently produced no purge at all: the combined
+				// stylesheet was inlined whole, 262,903 bytes of it.
+				return $this->purge_inline_bundle( $html );
 			}
 			$url  = $m[2];
 			$path = $this->url_to_path( $url );
@@ -894,6 +915,36 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 				if ( false === file_put_contents( $dest, $purged, LOCK_EX ) ) {
 					return $html;
 				}
+				$purged_css = $purged;
+			}
+
+			// On a cache hit the purged text was never loaded. Inline delivery
+			// needs it, so read it back; the file pass does not, and skipping the
+			// read there keeps the common path free of disk I/O.
+			if ( ! isset( $purged_css ) ) {
+				$purged_css = ( 'inline' === $this->general_setting( 'css_delivery', 'file' ) )
+					? (string) @file_get_contents( $dest )
+					: '';
+			}
+
+			// Inline delivery: swap the whole <link> for a <style> carrying the
+			// purged CSS, removing the render-blocking request rather than just
+			// shrinking it.
+			//
+			// This only became possible because of the purge. The cap is measured
+			// on the PURGED css, which is the only size that matters and the only
+			// one we could not know at enqueue time: combined_css_inline_body()
+			// weighs the FULL bundle, so a site whose bundle exceeds the cap but
+			// whose purged output sits far under it would never have inlined. On a
+			// measured site that was 65.7 KiB before purging and 19.2 KiB after -
+			// one side of the cap to the other.
+			if ( 'inline' === $this->general_setting( 'css_delivery', 'file' ) ) {
+				$inlined = $this->inline_purged_css( $html, $url, $purged_css );
+				if ( '' !== $inlined ) {
+					return $this->purge_inline_styles( $inlined, $tokens, $safelist );
+				}
+				// Over the cap, or the tag could not be matched: fall through and
+				// serve the purged FILE, which is still better than the full one.
 			}
 
 			$html = str_replace( $url, $dest_url, $html );
@@ -906,6 +957,92 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 		} catch ( Error $e ) {
 			return $html;   // PHP 7+ internal errors must not take the page down
 		}
+	}
+
+	/**
+	 * Purge the combined bundle where it was printed inline, plus WordPress's own
+	 * inline blocks. Used when there is no <link> to rewrite.
+	 *
+	 * @param string $html
+	 * @return string
+	 */
+	private function purge_inline_bundle( $html ) {
+		$id = self::COMBINED_CSS_HANDLE . '-inline-css';
+		if ( ! preg_match( '#(<style[^>]*\bid=([\'"])' . preg_quote( $id, '#' ) . '\2[^>]*>)(.*?)(</style>)#is', $html, $m ) ) {
+			return $html;
+		}
+
+		$tokens = FW_AO_Purger::collect_tokens( $html );
+		if ( empty( $tokens['classes'] ) && empty( $tokens['ids'] ) ) {
+			return $html;
+		}
+		$safelist = $this->get_purge_safelist();
+		$purged   = FW_AO_Purger::purge( $m[3], $tokens, $safelist );
+
+		// Same guard as the file pass: a near-total wipe means the scan failed,
+		// not that the page needs no CSS.
+		if ( '' === trim( $purged ) || strlen( $purged ) < ( strlen( $m[3] ) * 0.02 ) ) {
+			return $html;
+		}
+
+		$html = str_replace( $m[0], $m[1] . $purged . $m[4], $html );
+		return $this->purge_inline_styles( $html, $tokens, $safelist );
+	}
+
+	/**
+	 * Replace the combined stylesheet's <link> with an inline <style> carrying
+	 * the purged CSS, so the page has no render-blocking stylesheet request.
+	 *
+	 * Returns '' (and changes nothing) when it should not or cannot be done, so
+	 * the caller falls back to serving the purged FILE.
+	 *
+	 * @param string $html
+	 * @param string $url    The combined stylesheet URL as it appears in the tag.
+	 * @param string $purged The purged CSS.
+	 * @return string Modified HTML, or '' to decline.
+	 */
+	private function inline_purged_css( $html, $url, $purged ) {
+		if ( ! is_string( $purged ) || '' === trim( $purged ) ) {
+			return '';
+		}
+
+		// Weigh what actually travels. Inlining moves these bytes into every HTML
+		// response instead of a file the browser can cache, so past a certain size
+		// it costs more than the request it saves - and unlike the enqueue-time
+		// check, this measures the PURGED css.
+		$gz  = function_exists( 'gzencode' ) ? strlen( gzencode( $purged, 6 ) ) : (int) ( strlen( $purged ) / 5 );
+		$max = (int) apply_filters( 'fw:ext:asset-optimizer:css_inline_max_bytes', 51200 );
+		if ( $gz > $max ) {
+			return '';
+		}
+
+		// Match the whole <link> element carrying this href, whatever order its
+		// attributes are in.
+		$pattern = '#<link\b[^>]*\bhref=([\'"])' . preg_quote( $url, '#' ) . '\1[^>]*>#i';
+		if ( ! preg_match( $pattern, $html ) ) {
+			return '';
+		}
+
+		// @charset is only valid in a linked stylesheet, and a literal </style in
+		// a string or comment would end the block early.
+		$body = preg_replace( '#^\s*@charset\s+[^;]+;\s*#i', '', $purged );
+		$body = str_ireplace( '</style', '<\/style', $body );
+
+		$style = '<style id="' . esc_attr( self::COMBINED_CSS_HANDLE ) . '-inline-css">' . $body . '</style>';
+
+		return preg_replace( $pattern, $style, $html, 1 );
+	}
+
+	/**
+	 * @internal
+	 * Apply the Image quality setting to the core crop pipeline.
+	 *
+	 * @param int $quality Core's default (82).
+	 * @return int
+	 */
+	public function _filter_image_crop_quality( $quality ) {
+		$set = (int) $this->general_setting( 'image_quality', 0 );
+		return ( $set >= 1 && $set <= 100 ) ? $set : $quality;
 	}
 
 	/**

@@ -236,14 +236,14 @@ $options = array(
 								'no-validate' => true,
 								'choices' => array(
 									'file'   => __( 'Linked file (default)', 'fw' ),
-									'inline' => __( 'Inline in the page head', 'fw' ),
+									'inline' => __( 'Inline in the page head — no render-blocking request', 'fw' ),
 								),
 								'value'   => 'file',
 							),
 							'purge_css' => array(
 								'type'  => 'switch',
 								'label' => __( 'Remove unused CSS', 'fw' ),
-								'desc'  => __( 'Strip rules nothing on the page can use. A typical page uses under 15% of the CSS it downloads; on measured sites this halves the combined file. Each page gets its own purged copy, generated on its first view and cached afterwards. <strong>Off by default, and worth testing before you rely on it:</strong> a rule removed in error shows up as a wrong hover state or a broken menu rather than an error, so after switching it on, click through a few pages — open the menu, expand an accordion, hover the buttons. Anything that looks wrong can be protected with the safelist below. Requires <em>Combine CSS</em> on and <em>CSS delivery</em> set to a linked file.', 'fw' ),
+								'desc'  => __( 'Strip rules nothing on the page can use. A typical page uses under 15% of the CSS it downloads; on measured sites this halves the combined file. Each page gets its own purged copy, generated on its first view and cached afterwards. <strong>Off by default, and worth testing before you rely on it:</strong> a rule removed in error shows up as a wrong hover state or a broken menu rather than an error, so after switching it on, click through a few pages — open the menu, expand an accordion, hover the buttons. Anything that looks wrong can be protected with the safelist below. Requires <em>Combine CSS</em> on. Pairs well with <em>CSS delivery: Inline</em>: once the stylesheet has been trimmed it is usually small enough to put straight into the page, which removes the render-blocking request altogether.', 'fw' ),
 								'value' => false,
 							),
 							'purge_safelist' => array(
@@ -257,6 +257,17 @@ $options = array(
 								'label' => __( 'Preload the hero image', 'fw' ),
 								'desc'  => __( 'Tell the browser about the page\'s main image straight away, instead of leaving it to find it after the stylesheet has downloaded and the layout is built. This does not make anything smaller — it changes the <em>order</em> things are fetched, which is usually where a slow "largest contentful paint" actually comes from. The first image that is not lazy-loaded is treated as the hero; on a page that has none, nothing is added.', 'fw' ),
 								'value' => false,
+							),
+							'image_quality' => array(
+								'type'       => 'slider',
+								'label'      => __( 'Image quality', 'fw' ),
+								'desc'       => __( 'How hard to compress the cropped images the theme generates. Lower means smaller files. <strong>82 matches the WordPress default</strong> and is a safe place to stay; 80 is a little smaller again and hard to tell apart; below about 75 the difference starts to show on photographs, so check one you care about before keeping it. Changing this re-makes each crop the next time it is shown, so the saving appears gradually rather than all at once. PNG images are unaffected — PNG is lossless, so there is no quality to trade.', 'fw' ),
+								'value'      => 82,
+								'properties' => array(
+									'min'  => 40,
+									'max'  => 100,
+									'step' => 1,
+								),
 							),
 							'webp_images' => array(
 								'type'  => 'switch',
