@@ -17,6 +17,9 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 	const CACHE_SUBDIR             = 'unysonplus/asset-optimizer';
 	const DISCOVERY_QUERY_ARG      = 'fw_asset_optimizer_discover';
 	const NOPURGE_QUERY_ARG        = 'fw_ao_nopurge';
+	const HTACCESS_MARKER          = 'UnysonPlus Asset Optimizer';
+	const PAGE_HANDLES_PREFIX      = 'fw_ao_pg_';
+	const PAGE_HANDLES_MAX         = 120;
 	const DISCOVERY_TOKEN_PREFIX   = 'fw_ao_discover_';
 	const MIGRATION_OPTION         = 'fw_ext_asset_optimizer_migrated_v1';
 	const AUTOLOAD_FIX_OPTION      = 'fw_ext_asset_optimizer_autoload_v2';
@@ -326,6 +329,9 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 		// Persist which CSS handles are excluded (see recompute_css_exclusions).
 		$this->recompute_css_exclusions( $values );
 
+		// Apply (or withdraw) the static-asset cache policy to wp-content/.htaccess.
+		$this->sync_static_cache_htaccess( ! empty( $values['static_cache_headers'] ) );
+
 		wp_safe_redirect( add_query_arg( 'fw-saved', '1', self::get_page_url() ) );
 		exit;
 	}
@@ -339,6 +345,7 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 	 */
 	public function _after_manager_settings_saved( $options_before_save = array() ) {
 		$this->recompute_css_exclusions();
+		$this->sync_static_cache_htaccess();
 	}
 
 	/**
@@ -732,6 +739,33 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 	 */
 	public function purge_all() {
 		$this->purge_cache_files();
+		$this->forget_page_css_handles();
+	}
+
+	/**
+	 * Drop every page's remembered handle list.
+	 *
+	 * Called wherever the asset picture changes under us - a theme switch, a
+	 * plugin activated or deactivated, an update, a manual cache clear. The
+	 * memory is only an optimisation, so losing it costs one un-combined view
+	 * per page and nothing else; keeping a stale one could fold a handle into a
+	 * bundle that the page no longer prints.
+	 */
+	private function forget_page_css_handles() {
+		global $wpdb;
+		if ( ! isset( $wpdb ) || ! is_object( $wpdb ) ) {
+			return;
+		}
+		// Transients, so two rows per entry (value + timeout). No autoload
+		// concern; these are never loaded in bulk.
+		$like = $wpdb->esc_like( '_transient_' . self::PAGE_HANDLES_PREFIX ) . '%';
+		$like2 = $wpdb->esc_like( '_transient_timeout_' . self::PAGE_HANDLES_PREFIX ) . '%';
+		$wpdb->query( $wpdb->prepare(
+			"DELETE FROM {$wpdb->options} WHERE option_name LIKE %s OR option_name LIKE %s",
+			$like,
+			$like2
+		) );
+		wp_cache_flush();
 	}
 
 	/* ---------------------------------------------------------------------
@@ -1083,6 +1117,179 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 	}
 
 	/**
+	 * Is the static-asset cache policy switched on?
+	 *
+	 * @return bool
+	 */
+	private function static_cache_enabled() {
+		return (bool) $this->get_general_setting( 'static_cache_headers' );
+	}
+
+	/**
+	 * Does this server read .htaccess at all?
+	 *
+	 * Apache and LiteSpeed do; nginx ignores the file completely, so writing one
+	 * there would look like it worked while changing nothing. The settings screen
+	 * uses this to show the nginx config block instead of pretending.
+	 *
+	 * @return bool
+	 */
+	public static function server_reads_htaccess() {
+		$sw = isset( $_SERVER['SERVER_SOFTWARE'] ) ? strtolower( (string) $_SERVER['SERVER_SOFTWARE'] ) : '';
+		if ( '' === $sw ) {
+			return true; // unknown - the rules are inert if unsupported, so write them.
+		}
+		return ( false !== strpos( $sw, 'apache' ) || false !== strpos( $sw, 'litespeed' ) );
+	}
+
+	/**
+	 * Write (or remove) the wp-content/.htaccess block that gives static assets a
+	 * long browser-cache lifetime.
+	 *
+	 * Why this is separate from ensure_cache_headers(): that one covers only this
+	 * extension's OWN cache directory, where every filename contains a hash of the
+	 * file's contents and `immutable` is therefore free of risk. This block covers
+	 * everything else under wp-content - uploads, plugin and theme static files -
+	 * which are not content-addressed, so the policy is deliberately one notch
+	 * weaker: a year, but NOT `immutable`. `immutable` tells the browser not to
+	 * revalidate even on an explicit reload, which would make a replaced image
+	 * genuinely unfixable for a year; without it, a hard refresh still picks up a
+	 * replacement.
+	 *
+	 * Measured on a live site before this existed: the extension's own files came
+	 * back `max-age=31536000, immutable`, while uploads and theme fonts got the
+	 * host default of 604800 (7 days) and plugin static JS came back with no
+	 * Cache-Control header at all.
+	 *
+	 * Safety: the block is written through insert_with_markers(), so anything else
+	 * already in wp-content/.htaccess (a security plugin's rules, a hotlink guard)
+	 * is preserved, and switching the option off removes only our block. Every
+	 * directive is wrapped in IfModule, so a server without mod_headers/mod_expires
+	 * ignores it rather than returning a 500.
+	 *
+	 * @param bool|null $enabled Null = read the saved setting.
+	 * @return bool True when the file now matches the requested state.
+	 */
+	public function sync_static_cache_htaccess( $enabled = null ) {
+		if ( null === $enabled ) {
+			$enabled = $this->static_cache_enabled();
+		}
+		if ( ! function_exists( 'insert_with_markers' ) ) {
+			$misc = ABSPATH . 'wp-admin/includes/misc.php';
+			if ( ! file_exists( $misc ) ) {
+				return false;
+			}
+			require_once $misc;
+		}
+		$file = trailingslashit( WP_CONTENT_DIR ) . '.htaccess';
+		if ( ! $enabled ) {
+			// Nothing of ours to remove, and no reason to create the file.
+			if ( ! file_exists( $file ) ) {
+				return true;
+			}
+			return $this->remove_static_cache_rules( $file );
+		}
+		if ( ! is_writable( file_exists( $file ) ? $file : dirname( $file ) ) ) {
+			return false;
+		}
+		return (bool) insert_with_markers( $file, self::HTACCESS_MARKER, $this->static_cache_rules() );
+	}
+
+	/**
+	 * Strip our marker block out of an .htaccess, markers and all.
+	 *
+	 * insert_with_markers() with an empty list is the obvious way to do this, but
+	 * it leaves the BEGIN/END pair behind with nothing between them - a block of
+	 * dead comments sitting in the user's file for good after they switch the
+	 * option off. This removes the whole thing, and deletes the file if ours was
+	 * the only thing in it, so turning the setting off leaves no trace.
+	 *
+	 * @param string $file
+	 * @return bool
+	 */
+	private function remove_static_cache_rules( $file ) {
+		$lines = @file( $file, FILE_IGNORE_NEW_LINES );
+		if ( false === $lines ) {
+			return false;
+		}
+		$out    = array();
+		$inside = false;
+		foreach ( $lines as $line ) {
+			$t = trim( $line );
+			if ( ! $inside && 0 === strpos( $t, '# BEGIN ' . self::HTACCESS_MARKER ) ) {
+				$inside = true;
+				continue;
+			}
+			if ( $inside ) {
+				if ( 0 === strpos( $t, '# END ' . self::HTACCESS_MARKER ) ) {
+					$inside = false;
+				}
+				continue;
+			}
+			$out[] = $line;
+		}
+		if ( '' === trim( implode( '', $out ) ) ) {
+			return @unlink( $file );
+		}
+		return false !== @file_put_contents( $file, rtrim( implode( "
+", $out ) ) . "
+" );
+	}
+
+	/**
+	 * The .htaccess lines for the static-asset cache policy.
+	 *
+	 * @return string[]
+	 */
+	private function static_cache_rules() {
+		/**
+		 * File extensions given a long cache lifetime.
+		 *
+		 * @param string[] $exts
+		 */
+		$exts = (array) apply_filters(
+			'fw_ao_static_cache_extensions',
+			array( 'css', 'js', 'mjs', 'woff2', 'woff', 'ttf', 'otf', 'eot',
+				'svg', 'png', 'jpe?g', 'gif', 'webp', 'avif', 'ico', 'mp4', 'webm' )
+		);
+		$match = implode( '|', array_map( 'strval', $exts ) );
+
+		/**
+		 * Cache lifetime in seconds for the rule above (default one year).
+		 *
+		 * @param int $seconds
+		 */
+		$ttl = (int) apply_filters( 'fw_ao_static_cache_max_age', YEAR_IN_SECONDS );
+		$ttl = max( MINUTE_IN_SECONDS, $ttl );
+
+		return array(
+			'# Long browser-cache lifetime for static files under wp-content.',
+			'# Plugin and theme assets carry a ?ver= that changes when they are updated,',
+			"# and WordPress never overwrites an existing upload's filename, so a visitor",
+			'# cannot be served a stale file by a normal update. Note this is NOT marked',
+			'# immutable: replacing a file in place still takes effect on a hard refresh.',
+			'<IfModule mod_headers.c>',
+			"	<FilesMatch \"\.(" . $match . ')$">',
+			"		Header set Cache-Control \"public, max-age=" . $ttl . '"',
+			"	</FilesMatch>",
+			'</IfModule>',
+		);
+	}
+
+	/**
+	 * The equivalent nginx config, shown on the settings screen when the server
+	 * does not read .htaccess.
+	 *
+	 * @return string
+	 */
+	public static function static_cache_nginx_snippet() {
+		return "location ~* ^/wp-content/.*\.(css|js|woff2?|ttf|otf|eot|svg|png|jpe?g|gif|webp|avif|ico|mp4|webm)$ {
+"
+			. "    add_header Cache-Control \"public, max-age=31536000\";
+}";
+	}
+
+	/**
 	 * WordPress prints these stylesheets INLINE, which puts them out of reach of
 	 * both the combiner and the purger - they are not handles with a src, they
 	 * are <style> blocks in the head. On a page built with the page builder
@@ -1342,8 +1549,10 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 		wp_cache_delete( self::KNOWN_CSS_HANDLES_OPTION, 'options' );
 		wp_cache_delete( self::KNOWN_JS_HANDLES_OPTION, 'options' );
 
-		// A changed list usually means a changed bundle - drop stale files too.
+		// A changed list usually means a changed bundle - drop stale files too,
+		// and forget what each page remembered about its own handles.
 		$this->purge_cache_files();
+		$this->forget_page_css_handles();
 
 		$this->discover_handles();
 
@@ -1772,6 +1981,19 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 		}
 		$per_page = ( 'site' !== $this->general_setting( 'css_scope', 'per_page' ) );
 		$known    = $per_page ? $this->get_page_css_handles() : $this->get_known_css_handles();
+
+		// Per-page scope only sees the live queue, so fold in the handles THIS
+		// page used last time that are not in it yet - the ones enqueued after
+		// this pass runs. They are appended, not merged in place: they printed
+		// after everything here, so that is where they belong in the cascade.
+		// Their own <link> tags are suppressed by suppress_absorbed_css_tag()
+		// when they are enqueued later in the request, which already handles a
+		// handle printed after this hook.
+		if ( $per_page ) {
+			foreach ( $this->late_page_css_handles( $known ) as $handle => $src ) {
+				$known[ $handle ] = $src;
+			}
+		}
 		if ( empty( $known ) ) {
 			return;
 		}
@@ -2082,6 +2304,128 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 		}
 
 		$this->remember_css_handles( $wp_styles, $handles );
+		$this->remember_page_css_handles( $wp_styles, $handles );
+	}
+
+	/**
+	 * The transient key for THIS page's remembered handle list, or '' when the
+	 * request is not one whose handle list is worth keeping.
+	 *
+	 * Keyed by PATH only - the query string is deliberately dropped, so
+	 * ?utm_source=… and a pagination arg do not each mint their own row.
+	 *
+	 * @return string
+	 */
+	private function page_handles_key() {
+		if ( is_admin() || wp_doing_ajax() || ( defined( 'REST_REQUEST' ) && REST_REQUEST ) ) {
+			return '';
+		}
+		if ( ! empty( $_POST ) || ( isset( $_SERVER['REQUEST_METHOD'] ) && 'GET' !== strtoupper( $_SERVER['REQUEST_METHOD'] ) ) ) {
+			return '';
+		}
+		if ( function_exists( 'is_404' ) && did_action( 'template_redirect' ) && is_404() ) {
+			return ''; // every bad URL is a different path; do not mint a row per typo
+		}
+		$path = isset( $_SERVER['REQUEST_URI'] ) ? (string) wp_unslash( $_SERVER['REQUEST_URI'] ) : '/';
+		$path = strtok( $path, '?' );
+		if ( ! is_string( $path ) || '' === $path ) {
+			$path = '/';
+		}
+		return self::PAGE_HANDLES_PREFIX . substr( md5( $path ), 0, 16 );
+	}
+
+	/**
+	 * Remember which stylesheets THIS page used, so the next view of it can fold
+	 * in the ones that were enqueued too late to be combined.
+	 *
+	 * Why this exists: with per-page scope the bundle is built from the LIVE
+	 * queue at wp_enqueue_scripts:99999. Anything enqueued after that - a
+	 * shortcode's stylesheet registered while the content renders, a plugin that
+	 * enqueues during the_content - is never in it, and per-page scope has no
+	 * memory, so it is missed again on every single request, forever. Measured on
+	 * a converted site: 7 shortcode stylesheets, ~35 KB, render-blocking, on
+	 * every page view.
+	 *
+	 * Site-wide scope does not have the problem (it builds from the persisted
+	 * map), but paying for it by switching scope is a bad trade - measured on the
+	 * same site, site-wide + purge is 112.0 KiB gzipped against per-page's 27.8,
+	 * because the bundle then carries CSS for every page on the site and the
+	 * safelist protects much of it from the purge. So: keep per-page's small
+	 * bundle, and give it the memory it was missing.
+	 *
+	 * Only `all`-media handles are recorded: a print- or query-scoped sheet must
+	 * stay its own tag, and the remembered list carries no media information.
+	 *
+	 * @param WP_Styles $styles
+	 * @param string[]  $handles
+	 */
+	private function remember_page_css_handles( $styles, $handles ) {
+		$key = $this->page_handles_key();
+		if ( '' === $key ) {
+			return;
+		}
+
+		$keep = array();
+		foreach ( $handles as $handle ) {
+			$reg = isset( $styles->registered[ $handle ] ) ? $styles->registered[ $handle ] : null;
+			if ( ! $reg || empty( $reg->src ) ) {
+				continue;
+			}
+			$media = isset( $reg->args ) ? $reg->args : 'all';
+			if ( $media && 'all' !== $media ) {
+				continue;
+			}
+			$keep[] = $handle;
+			if ( count( $keep ) >= self::PAGE_HANDLES_MAX ) {
+				break;
+			}
+		}
+		if ( empty( $keep ) ) {
+			return;
+		}
+
+		// Only write when the set actually changed - a page whose handles are
+		// stable should not re-write a transient on every single view.
+		$prev = get_transient( $key );
+		if ( is_array( $prev ) && $prev === $keep ) {
+			return;
+		}
+		set_transient( $key, $keep, WEEK_IN_SECONDS );
+	}
+
+	/**
+	 * The handles this page used last time that are NOT in the live queue now -
+	 * i.e. the ones enqueued too late for the combine pass to see.
+	 *
+	 * Sources come from the site-wide map, which is already filtered for dead
+	 * files and backend-only assets, so a handle that has since been removed or
+	 * turns out to be admin-only cannot come back through this door.
+	 *
+	 * @param array $live handle => src for this request.
+	 * @return array handle => src
+	 */
+	private function late_page_css_handles( array $live ) {
+		$key = $this->page_handles_key();
+		if ( '' === $key ) {
+			return array();
+		}
+		$remembered = get_transient( $key );
+		if ( ! is_array( $remembered ) || empty( $remembered ) ) {
+			return array();
+		}
+
+		$global = $this->get_known_css_handles();
+		$out    = array();
+		foreach ( $remembered as $handle ) {
+			if ( isset( $live[ $handle ] ) || ! isset( $global[ $handle ] ) ) {
+				continue;
+			}
+			if ( $handle === self::COMBINED_CSS_HANDLE ) {
+				continue;
+			}
+			$out[ $handle ] = $global[ $handle ];
+		}
+		return $out;
 	}
 
 	/**

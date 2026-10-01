@@ -185,6 +185,15 @@ if ( empty( $js_choices ) ) {
 		. '</p>';
 }
 
+// On a server that does not read .htaccess (nginx), say so up front and give the
+// equivalent config, rather than offering a switch that would silently do nothing.
+$fw_ao_static_cache_desc = '';
+if ( class_exists( 'FW_Extension_Asset_Optimizer' ) && ! FW_Extension_Asset_Optimizer::server_reads_htaccess() ) {
+	$fw_ao_static_cache_desc = '<strong>' . esc_html__( 'This server does not use .htaccess, so this switch cannot apply the rule itself.', 'fw' ) . '</strong> '
+		. esc_html__( 'Add the equivalent to your server config instead:', 'fw' )
+		. '<pre style="white-space:pre-wrap;margin:6px 0">' . esc_html( FW_Extension_Asset_Optimizer::static_cache_nginx_snippet() ) . '</pre>';
+}
+
 $options = array(
 	/** Filters options inserted before the asset-optimizer settings tabs so extensions can prepend their own settings fields. */
 	apply_filters( 'fw:ext:asset-optimizer:settings-options:before', array() ),
@@ -273,6 +282,12 @@ $options = array(
 								'type'  => 'switch',
 								'label' => __( 'Serve WebP images', 'fw' ),
 								'desc'  => __( 'Make a WebP copy of every uploaded JPG / PNG (and each of its sizes and crops) and show visitors the WebP instead: usually 25–80% smaller for the same look. The originals are kept untouched, so turning this off simply goes back to them. Existing images are converted gradually as pages are viewed.', 'fw' ),
+								'value' => false,
+							),
+							'static_cache_headers' => array(
+								'type'  => 'switch',
+								'label' => __( 'Browser cache for static files', 'fw' ),
+								'desc'  => $fw_ao_static_cache_desc . __( 'Ask browsers to keep images, fonts, scripts and stylesheets for a year instead of re-checking them on every visit. This only affects <strong>repeat</strong> visits — a first-time visitor downloads everything either way — so treat it as a small, free win rather than a fix for a slow page. The generated files this extension makes are already cached this way; switching this on extends the same policy to your uploads, plugins and themes by adding a block to <code>wp-content/.htaccess</code> (anything already in that file is left alone, and turning this off removes only the block it added). Plugin and theme files carry a version in their URL that changes when they update, and WordPress never reuses an upload filename, so a normal update cannot leave anyone looking at a stale file. The one case to know about: if you replace a file in place — over FTP, or with a "replace media" plugin — people who already have it keep the old one until a hard refresh. Needs Apache or LiteSpeed; on nginx the rule belongs in your server config instead.', 'fw' ),
 								'value' => false,
 							),
 							'logged_out_only' => array(

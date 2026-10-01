@@ -5,6 +5,21 @@
 /**
  * Changelog ----------------------------------------------------------------
  *
+ * 1.1.55 - "Browser cache for static files" switch on the General tab (off by
+ *          default). The extension already gave its own generated files a
+ *          one-year lifetime; measured on a live site, everything else was
+ *          still on the host default - uploads and theme fonts at 7 days, and
+ *          plugin static JS with no Cache-Control header at all. Switching this
+ *          on writes a marked block into wp-content/.htaccess covering uploads,
+ *          plugins and themes. Deliberately NOT marked immutable, unlike the
+ *          extension's own cache directory: those filenames are content hashes,
+ *          these are not, and immutable would stop a hard refresh picking up a
+ *          file replaced in place. Written via insert_with_markers() so other
+ *          rules in the file survive; switching it off strips the block and
+ *          markers entirely, deleting the file if nothing else was in it.
+ *          Filters: fw_ao_static_cache_extensions, fw_ao_static_cache_max_age.
+ *          Apache / LiteSpeed only; the settings screen shows the nginx form.
+ *
  * 1.1.42 - "Serve WebP images" switch on the General tab (off by default).
  *          Every uploaded JPG / PNG, each of its generated sizes and each
  *          responsive crop from fw_image_crop_renditions() gets a WebP copy
@@ -137,7 +152,7 @@ $manifest['description'] = __(
 	'fw'
 );
 
-$manifest['version']    = '1.1.53';
+$manifest['version']    = '1.1.55';
 $manifest['github_update'] = 'UnysonPlus/UnysonPlus-Asset-Optimizer-Extension';
 $manifest['display']    = true;
 $manifest['standalone'] = true;
