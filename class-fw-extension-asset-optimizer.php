@@ -5,6 +5,7 @@
 // Standalone, dependency-free CSS/JS minifiers (extracted for testability).
 require_once __DIR__ . '/includes/class-fw-ao-minifier.php';
 require_once __DIR__ . '/includes/class-fw-ao-webp.php';
+require_once __DIR__ . '/includes/class-fw-ao-subsizes.php';
 require_once __DIR__ . '/includes/class-fw-ao-purger.php';
 
 class FW_Extension_Asset_Optimizer extends FW_Extension {
@@ -104,6 +105,12 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 			add_action( 'fw_extension_settings_form_saved:' . $this->get_name(), array( $this, '_after_manager_settings_saved' ) );
 		}
 
+		// Fill in intermediate image sizes an import never generated (opt-in), so a
+		// srcset has something between the smallest size and the full original.
+		if ( ! empty( $this->general_setting( 'generate_image_sizes', false ) ) ) {
+			FW_AO_Subsizes::init();
+			add_action( 'attachment_updated', array( 'FW_AO_Subsizes', 'on_attachment_updated' ) );
+		}
 		// Serve WebP images (opt-in). Registered in every context: copies are made on
 		// upload (admin / REST) and swapped in on the front end.
 		if ( ! empty( $this->general_setting( 'webp_images', false ) ) ) {
@@ -157,7 +164,7 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 		// later view is a cache hit and does no CSS work at all.
 		// One buffer, several passes. Purging and the LCP preload both need the
 		// finished HTML, so they share a single ob_start rather than nesting two.
-		if ( $this->purge_enabled() || $this->preload_lcp_enabled() ) {
+		if ( $this->purge_enabled() || $this->preload_lcp_enabled() || $this->hoist_styles_enabled() ) {
 			add_action( 'template_redirect', array( $this, 'start_purge_buffer' ), 1 );
 		}
 
@@ -867,6 +874,9 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 		if ( ! is_string( $html ) || strlen( $html ) < 200 || false === stripos( $html, '</html>' ) ) {
 			return $html; // not a full document (a REST / partial response)
 		}
+		if ( $this->hoist_styles_enabled() ) {
+			$html = $this->hoist_late_styles( $html );
+		}
 		if ( $this->purge_enabled() ) {
 			$html = $this->purge_buffer( $html );
 		}
@@ -874,6 +884,89 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 			$html = $this->preload_lcp_image( $html );
 		}
 		return $html;
+	}
+
+	/** Is the late-<style> hoist switched on, and is this a request it should touch? */
+	private function hoist_styles_enabled() {
+		if ( empty( $this->general_setting( 'hoist_late_styles', false ) ) ) {
+			return false;
+		}
+		if ( is_admin() || wp_doing_ajax() || ( defined( 'REST_REQUEST' ) && REST_REQUEST ) ) {
+			return false;
+		}
+		return ! $this->request_is_editor();
+	}
+
+	/**
+	 * Move <style> blocks that were printed in the BODY up into the end of <head>.
+	 *
+	 * Why: an element's CSS that arrives after the browser has already painted it
+	 * makes the page jump. The page builder collects each flexbox instance's rules
+	 * while the content renders and prints them as one consolidated block on
+	 * wp_footer - good for the number of requests, but those rules include
+	 * max-width and margin:auto, i.e. they decide where the element SITS.
+	 *
+	 * Measured on a real page: the hero painted left-aligned at x=24, the footer
+	 * <style> landed, and it jumped to its centred position at x=384 - a 360px
+	 * horizontal move, worth 0.1485 CLS on its own. Hoisting the blocks into the
+	 * head took that to 0 with the final layout byte-for-byte identical (the hero
+	 * ends at x=384 either way): the page does not look different, it just stops
+	 * moving. Lighthouse blames "Web font" for this shift; blocking every font
+	 * outright left it at 0.1451, so the font is not the cause.
+	 *
+	 * Cascade safety: the blocks keep their order relative to one another and are
+	 * inserted at the very END of <head>, after every stylesheet already there, so
+	 * each rule keeps the same priority it had. Nothing else in a normal document
+	 * sits between them and the body.
+	 *
+	 * @param string $html
+	 * @return string
+	 */
+	public function hoist_late_styles( $html ) {
+		try {
+			$head_end = stripos( $html, '</head>' );
+			if ( false === $head_end ) {
+				return $html;
+			}
+			$head = substr( $html, 0, $head_end );
+			$body = substr( $html, $head_end );
+
+			// Only id'd blocks: those are the ones WordPress, this plugin and the
+			// theme emit. An anonymous <style> is more likely to be hand-written
+			// into the content, where its position may be deliberate.
+			if ( ! preg_match_all( '#<style\b[^>]*\bid=(["\'])([^"\']+)\1[^>]*>.*?</style>#is', $body, $m, PREG_SET_ORDER ) ) {
+				return $html;
+			}
+
+			/**
+			 * Ids that must stay where they were printed.
+			 *
+			 * @param string[] $skip
+			 */
+			$skip = (array) apply_filters( 'fw_ao_hoist_styles_skip', array() );
+
+			$moved = '';
+			foreach ( $m as $hit ) {
+				$block = $hit[0];
+				$id    = $hit[2];
+				if ( in_array( $id, $skip, true ) ) {
+					continue;
+				}
+				// A <style> inside <noscript> is conditional markup, not page CSS.
+				$pos = strpos( $body, $block );
+				if ( false !== $pos && false !== stripos( substr( $body, max( 0, $pos - 120 ), 120 ), '<noscript' ) ) {
+					continue;
+				}
+				$moved .= $block;
+				$body   = str_replace( $block, '', $body );
+			}
+			if ( '' === $moved ) {
+				return $html;
+			}
+			return $head . $moved . $body;
+		} catch ( Exception $e ) {
+			return $html; // never break a page over a cosmetic move
+		}
 	}
 
 	/**
@@ -1796,6 +1889,9 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 	 *
 	 * @var array|null
 	 */
+	/** Memoized result of request_is_editor(). */
+	private $request_is_editor_cache = null;
+
 	private $settings_store_cache = null;
 
 	/** Memoized settings store (frontend-safe; see $settings_store_cache). */
@@ -1822,6 +1918,9 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 		if ( empty( $this->general_setting( 'js' === $type ? 'combine_js' : 'combine_css', true ) ) ) {
 			return false;
 		}
+		if ( $this->request_is_editor() ) {
+			return false;
+		}
 		if ( ! empty( $this->general_setting( 'logged_out_only', false ) ) && is_user_logged_in() ) {
 			return false;
 		}
@@ -1829,6 +1928,59 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 			return false;
 		}
 		return true;
+	}
+
+	/**
+	 * Is a front-end EDITOR rendering this page, rather than a visitor reading it?
+	 *
+	 * The Live Editor draws its whole interface - panels, toolbars, the element
+	 * list - with JavaScript, after the document has loaded. None of those class
+	 * names exist in the HTML the purger scans, so every rule that styles the
+	 * editor looks unused and is removed, and the editor renders as an unstyled
+	 * stack of links. The safelist cannot help: the markup does not exist yet at
+	 * scan time, and listing an entire extension's CSS by hand would be a list
+	 * nobody maintains.
+	 *
+	 * So the whole optimizer stands down for these requests - combining as well
+	 * as purging. Combining is not what broke the editor, but turning it off here
+	 * too means the editor sees exactly the stylesheets it enqueued, in the order
+	 * it enqueued them, which is the state it was built against. Nothing is lost:
+	 * this is a logged-in authoring screen, not a page being served to visitors,
+	 * so there is no performance to win.
+	 *
+	 * Detection is by query var rather than by asking the Live Editor, because
+	 * its own check is private and the optimizer must decide before the editor
+	 * has necessarily loaded.
+	 *
+	 * @return bool
+	 */
+	private function request_is_editor() {
+		if ( null !== $this->request_is_editor_cache ) {
+			return $this->request_is_editor_cache;
+		}
+		/**
+		 * Query vars that mark a front-end editing context. Any extension that
+		 * renders an editor through the theme should add its own here.
+		 *
+		 * @param string[] $vars
+		 */
+		$vars = (array) apply_filters(
+			'fw_ao_editor_query_vars',
+			array( 'fw-live-editor', 'fw-live-editor-frame' )
+		);
+		$is = false;
+		foreach ( $vars as $var ) {
+			if ( '' !== (string) $var && isset( $_GET[ (string) $var ] ) ) {
+				$is = true;
+				break;
+			}
+		}
+		/**
+		 * Skip ALL asset optimization (combining and purging) for this request.
+		 *
+		 * @param bool $skip
+		 */
+		return $this->request_is_editor_cache = (bool) apply_filters( 'fw_ao_skip_request', $is );
 	}
 
 	/** Whether the current request path matches any Exclude-URL pattern (* = wildcard). */

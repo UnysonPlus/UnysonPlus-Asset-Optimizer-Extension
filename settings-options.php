@@ -261,10 +261,16 @@ $options = array(
 								'desc'  => __( 'One entry per line: any selector containing the text is kept. Wrap in slashes for a regular expression, e.g. <code>/^\\.promo-/</code>. Common state classes (<code>is-</code>, <code>has-</code>, <code>active</code>, <code>open</code>…), all hover/focus rules, animation and slider classes, and the Animation Engine are already protected — add entries here only for class names your own code adds with JavaScript.', 'fw' ),
 								'value' => '',
 							),
+							'hoist_late_styles' => array(
+								'type'  => 'switch',
+								'label' => __( 'Move late CSS into the head', 'fw' ),
+								'desc'  => __( 'Some elements write their own CSS while the page is being built, and it ends up at the bottom of the page &mdash; after the browser has already drawn them. Rules that decide how wide an element is, or whether it is centred, then arrive too late, and the element visibly jumps into place. On a measured page the hero was drawn against the left edge and then jumped 360 pixels across when its CSS finally loaded; that single jump accounted for the entire layout-shift score on that page. Switching this on collects those blocks and puts them in the page head, where they belong, so everything is drawn in its final position the first time. The page looks exactly the same once loaded &mdash; it just stops moving while it gets there.', 'fw' ),
+								'value' => false,
+							),
 							'preload_lcp_image' => array(
 								'type'  => 'switch',
 								'label' => __( 'Preload the hero image', 'fw' ),
-								'desc'  => __( 'Tell the browser about the page\'s main image straight away, instead of leaving it to find it after the stylesheet has downloaded and the layout is built. This does not make anything smaller — it changes the <em>order</em> things are fetched, which is usually where a slow "largest contentful paint" actually comes from. The first image that is not lazy-loaded is treated as the hero; on a page that has none, nothing is added.', 'fw' ),
+								'desc'  => __( 'Tell the browser about the page\'s main image straight away, instead of leaving it to find it after the stylesheet has downloaded and the layout is built. This does not make anything smaller — it changes the <em>order</em> things are fetched, which is usually where a slow "largest contentful paint" actually comes from. The hero is taken to be the first reasonably-sized image after your header, skipping logos and icons. Lazy images are deliberately <em>included</em> in that search, because the page builder marks every image lazy &mdash; including the one in your hero, which is exactly the element the score is measured on. Its <code>loading="lazy"</code> is removed. If no suitable image is found, nothing is added.', 'fw' ),
 								'value' => false,
 							),
 							'image_quality' => array(
@@ -277,6 +283,12 @@ $options = array(
 									'max'  => 100,
 									'step' => 1,
 								),
+							),
+							'generate_image_sizes' => array(
+								'type'  => 'switch',
+								'label' => __( 'Generate missing image sizes', 'fw' ),
+								'desc'  => __( 'Make the in-between sizes for images that do not have them, so the browser can pick a file that suits the space it is filling rather than always taking the full-size original. Images imported by the Site Converter are the usual case: it generates only two sizes on purpose, because resizing is the slowest part of a conversion. On a measured page the result was a 1024-pixel-wide slot downloading the 1440-wide original at 91.9 KB; with the missing sizes in place the browser took the 1024-wide file at 67.7 KB instead &mdash; <strong>26% less for exactly the same picture</strong>. The work is done a little at a time as pages are viewed (one image per view), so nothing stalls, and a busy page catches up over its next few visits. An image that cannot be processed is marked and not retried.', 'fw' ),
+								'value' => false,
 							),
 							'webp_images' => array(
 								'type'  => 'switch',

@@ -5,6 +5,43 @@
 /**
  * Changelog ----------------------------------------------------------------
  *
+ * 1.1.59 - "Move late CSS into the head" switch on the General tab (off by
+ *          default). The page builder collects each flexbox instance's rules
+ *          while the content renders and prints them as one consolidated
+ *          <style> on wp_footer. Those rules include max-width and
+ *          margin:auto, i.e. they decide where an element sits, so the browser
+ *          paints the element in the wrong place and moves it when they land.
+ *          Measured on a converted page: the hero painted left-aligned at x=24
+ *          and jumped to its centred x=384 when the footer block arrived - a
+ *          360px horizontal move worth 0.1468 CLS, the whole of that page's
+ *          layout-shift score. Hoisting the blocks into the end of <head> took
+ *          it to 0.0000 with zero computed-style differences across 249
+ *          elements: the page renders identically, it just stops moving.
+ *          Cascade-safe because the blocks keep their relative order and land
+ *          after every stylesheet already in the head. Skips the Live Editor
+ *          and admin; filter fw_ao_hoist_styles_skip exempts an id.
+ *          NOTE: Lighthouse attributes this shift to "Web font". It is not the
+ *          font - blocking every font outright still measured 0.1451.
+ *
+ * 1.1.58 - "Generate missing image sizes" switch on the General tab (off by
+ *          default). A srcset can only offer the sizes that exist on disk, and
+ *          an attachment imported with a trimmed size set offers a 300w file
+ *          and the full-size original and nothing between, so every visitor
+ *          takes the original however small the slot. Measured: a 1024x434 slot
+ *          pulled the 1440w file at 91.9 KiB where the 1024w file is 67.7 KiB,
+ *          26% less for identical rendered pixels. Missing sizes are now filled
+ *          in during page rendering, one attachment per request (filter
+ *          fw_ao_subsizes_per_request), measured at ~154ms for one 1440x611
+ *          original. Hooked on wp_calculate_image_srcset_meta, which runs
+ *          BEFORE the candidate list is built, so the srcset is corrected on
+ *          the same request that triggers the work rather than the next one.
+ *          An attachment whose sizes cannot be produced is marked and skipped:
+ *          wp_update_image_subsizes() returns an ordinary array rather than a
+ *          WP_Error for a corrupt original, so success is judged by whether the
+ *          missing-size count actually fell - without that, one unfixable image
+ *          would consume the per-request budget on every view and block every
+ *          other image on the page.
+ *
  * 1.1.55 - "Browser cache for static files" switch on the General tab (off by
  *          default). The extension already gave its own generated files a
  *          one-year lifetime; measured on a live site, everything else was
@@ -152,7 +189,7 @@ $manifest['description'] = __(
 	'fw'
 );
 
-$manifest['version']    = '1.1.55';
+$manifest['version']    = '1.1.59';
 $manifest['github_update'] = 'UnysonPlus/UnysonPlus-Asset-Optimizer-Extension';
 $manifest['display']    = true;
 $manifest['standalone'] = true;
