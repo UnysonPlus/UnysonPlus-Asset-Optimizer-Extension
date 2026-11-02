@@ -5,6 +5,40 @@
 /**
  * Changelog ----------------------------------------------------------------
  *
+ * 1.1.61 - "Drop admin-only stylesheets" switch on the General tab (off by
+ *          default). is_backend_css_handle() already recognised dashicons, the
+ *          admin bar, wp-pointer and the option-type panel styles, but it was
+ *          only ever consulted while BUILDING the combined file - excluding a
+ *          handle from the bundle leaves its own <link> in place, so the
+ *          browser still fetched it as a separate render-blocking request.
+ *          Measured on a real site: dashicons.min.css, 35.6KB, 100% unused,
+ *          downloaded by every logged-out visitor for an icon font that only
+ *          wp-admin draws. This dequeues them instead. Resolves the dependency
+ *          closure first (all_deps), because dashicons normally arrives as a
+ *          dependency of another handle rather than queued directly, then
+ *          clears $styles->to_do so the print pass recomputes. Stands down
+ *          while the admin toolbar is showing (it uses those glyphs), for the
+ *          Live Editor, and on excluded URLs. Opt-in because a theme is free to
+ *          use a dashicon on the public site.
+ *
+ * 1.1.60 - Filter fw:ext:asset-optimizer:protected_classes, so an element can
+ *          register the class names it builds in JavaScript and have their CSS
+ *          survive the purge. collect_tokens() scans the rendered HTML, so a
+ *          class that only ever appears in an external .js file is never seen,
+ *          every rule naming it looks unused, and it is removed - silently, the
+ *          only symptom being CSS absent from the served file. Reported from a
+ *          live site: the table of contents builds its items, links and numbers
+ *          in JS, so .sc-toc__num and .sc-toc__link were purged, the links
+ *          rendered as plain inline text and failed the 24px tap-target audit.
+ *          Entries are plain class names, escaped and anchored on a word
+ *          boundary, so `sc-toc` covers the whole family; the existing
+ *          purge_safelist filter still takes full patterns. Registering from an
+ *          element's static.php scopes the protection to pages that contain it.
+ *          Also: safelist patterns are now compiled once and the unusable ones
+ *          dropped and reported in wp-admin. selector_survives() matches with
+ *          @preg_match(), which treats a malformed pattern as "no match", so a
+ *          typo used to protect nothing at all with no indication why.
+ *
  * 1.1.59 - "Move late CSS into the head" switch on the General tab (off by
  *          default). The page builder collects each flexbox instance's rules
  *          while the content renders and prints them as one consolidated
@@ -189,7 +223,7 @@ $manifest['description'] = __(
 	'fw'
 );
 
-$manifest['version']    = '1.1.59';
+$manifest['version']    = '1.1.61';
 $manifest['github_update'] = 'UnysonPlus/UnysonPlus-Asset-Optimizer-Extension';
 $manifest['display']    = true;
 $manifest['standalone'] = true;

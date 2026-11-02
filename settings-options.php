@@ -261,6 +261,12 @@ $options = array(
 								'desc'  => __( 'One entry per line: any selector containing the text is kept. Wrap in slashes for a regular expression, e.g. <code>/^\\.promo-/</code>. Common state classes (<code>is-</code>, <code>has-</code>, <code>active</code>, <code>open</code>…), all hover/focus rules, animation and slider classes, and the Animation Engine are already protected — add entries here only for class names your own code adds with JavaScript.', 'fw' ),
 								'value' => '',
 							),
+							'drop_admin_assets' => array(
+								'type'  => 'switch',
+								'label' => __( 'Drop admin-only stylesheets', 'fw' ),
+								'desc'  => __( 'WordPress loads the icon font it uses for its own dashboard — <code>dashicons</code>, about 36&nbsp;KB — on the public site as well, where not one of its icons is ever drawn. It is a render-blocking request that every visitor waits for and none of them benefits from. The same goes for the editor and page-builder panel styles, which only exist inside wp-admin. Switching this on stops them being requested on the front end. It is left alone while the admin toolbar is on screen, because the toolbar genuinely uses those icons, so what you see while logged in is unchanged — log out, or use a private window, to see the difference. Independent of <em>Combine CSS</em>: those files were already kept out of the combined stylesheet, but keeping them out of the bundle still left the browser fetching them separately, which is the request this removes.', 'fw' ),
+								'value' => false,
+							),
 							'hoist_late_styles' => array(
 								'type'  => 'switch',
 								'label' => __( 'Move late CSS into the head', 'fw' ),

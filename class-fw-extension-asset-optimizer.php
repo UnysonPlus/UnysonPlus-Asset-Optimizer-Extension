@@ -103,6 +103,10 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 			// same in _maybe_save_settings). Both entry points write to the same store,
 			// so both must keep the derived exclusion list in sync.
 			add_action( 'fw_extension_settings_form_saved:' . $this->get_name(), array( $this, '_after_manager_settings_saved' ) );
+
+			// Report safelist entries PCRE cannot compile. Without this the only
+			// symptom of a typo is CSS quietly going missing on the front end.
+			add_action( 'admin_notices', array( $this, '_safelist_error_notice' ) );
 		}
 
 		// Fill in intermediate image sizes an import never generated (opt-in), so a
@@ -146,6 +150,11 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 		// MUST run after that so our dependency-resolved capture reflects the
 		// theme's intended order; otherwise the combined file bakes in the wrong
 		// cascade and breaks layouts (e.g. the header).
+		// Drop admin-only stylesheets (opt-in). At 99998, i.e. BEFORE the combiner
+		// below: the capture at 99999 must see the list as it will actually be
+		// printed, or the dequeued handles would still be baked into the bundle.
+		add_action( 'wp_enqueue_scripts', array( $this, 'dequeue_admin_assets' ), 99998 );
+
 		add_action( 'wp_enqueue_scripts', array( $this, 'enqueue_combined_css' ), 99999 );
 
 		// Combine eligible footer scripts. Same late priority so registrations,
@@ -847,11 +856,143 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 		}
 
 		/**
+		 * Class names (or prefixes) whose rules must never be purged - the
+		 * ergonomic form of the safelist, for code that KNOWS what it generates.
+		 *
+		 * An element that builds its own markup in JavaScript is invisible to the
+		 * purge: collect_tokens() scans the rendered HTML, so a class that only
+		 * ever appears in an external .js file is never seen, every rule naming it
+		 * looks unused, and it is removed. The failure is silent and looks like a
+		 * styling bug - the rule is simply absent from the served file.
+		 *
+		 * Registering a class here is the fix, and it needs no regex: each entry
+		 * is escaped and anchored on a word boundary, so `sc-toc` protects
+		 * `sc-toc`, `sc-toc__num` and `.sc-toc__link` alike. Register from the
+		 * element's own static.php and the protection is scoped to pages that
+		 * actually contain it, which keeps the purge effective everywhere else.
+		 *
+		 * Use fw:ext:asset-optimizer:purge_safelist instead when a full pattern is
+		 * genuinely needed.
+		 *
+		 * @param string[] $classes Plain class names or prefixes, no delimiters.
+		 */
+		$classes = apply_filters( 'fw:ext:asset-optimizer:protected_classes', array() );
+		if ( is_array( $classes ) ) {
+			foreach ( $classes as $class ) {
+				$class = trim( (string) $class );
+				if ( '' === $class ) {
+					continue;
+				}
+				$patterns[] = '~\b' . preg_quote( $class, '~' ) . '~';
+			}
+		}
+
+		/**
 		 * Filter the purge safelist.
 		 *
 		 * @param string[] $patterns Full preg patterns.
 		 */
-		return apply_filters( 'fw:ext:asset-optimizer:purge_safelist', $patterns );
+		$patterns = apply_filters( 'fw:ext:asset-optimizer:purge_safelist', $patterns );
+
+		return $this->validate_safelist( $patterns );
+	}
+
+	/**
+	 * Drop patterns PCRE cannot compile, and remember them so the failure is visible.
+	 *
+	 * selector_survives() matches with `@preg_match()`, which treats a malformed
+	 * pattern as "no match". That is the right behaviour there - one bad entry must
+	 * not warn on every selector of every page - but it means a typo in the safelist
+	 * silently protects NOTHING, and the only symptom is CSS disappearing. That cost
+	 * real debugging time on a live site, so the compile is now done once, here,
+	 * where the result can be reported.
+	 *
+	 * Validating a pattern means compiling it; there is no cheaper test. So the
+	 * results are memoized per request, and the whole list is keyed by its own hash
+	 * (the user can change the setting, and a filter can vary by page).
+	 *
+	 * @param string[] $patterns
+	 * @return string[] Only the patterns that compile.
+	 */
+	private function validate_safelist( array $patterns ) {
+		$key = md5( implode( "\n", $patterns ) );
+		if ( isset( $this->safelist_valid_cache[ $key ] ) ) {
+			return $this->safelist_valid_cache[ $key ];
+		}
+
+		$valid = array();
+		foreach ( $patterns as $pattern ) {
+			$pattern = (string) $pattern;
+			if ( '' === $pattern ) {
+				continue;
+			}
+			// A pattern that compiles returns 0 or 1; a broken one returns false.
+			if ( false === @preg_match( $pattern, '' ) ) {
+				self::$safelist_errors[ $pattern ] = true;
+				continue;
+			}
+			$valid[] = $pattern;
+		}
+
+		if ( ! empty( self::$safelist_errors ) && defined( 'WP_DEBUG' ) && WP_DEBUG ) {
+			foreach ( array_keys( self::$safelist_errors ) as $bad ) {
+				error_log( 'UnysonPlus Asset Optimizer: ignoring an unusable CSS safelist pattern: ' . $bad );
+			}
+		}
+
+		$this->safelist_valid_cache = array( $key => $valid ); // one entry is enough
+		return $valid;
+	}
+
+	/**
+	 * Safelist patterns that could not be compiled on this request.
+	 *
+	 * @return string[]
+	 */
+	public static function get_safelist_errors() {
+		return array_keys( self::$safelist_errors );
+	}
+
+	/**
+	 * Warn in wp-admin about safelist entries that cannot be used.
+	 *
+	 * Shown on every admin screen rather than only on the Asset Optimizer's own
+	 * settings page: the symptom of a broken pattern is missing CSS on the FRONT
+	 * end, so somebody chasing that will not necessarily think to open the page
+	 * where the pattern was typed.
+	 *
+	 * @internal
+	 */
+	public function _safelist_error_notice() {
+		if ( ! current_user_can( 'manage_options' ) || ! $this->purge_enabled() ) {
+			return;
+		}
+
+		// Populate the error list: nothing has run the purge on an admin request.
+		$this->get_purge_safelist();
+
+		$errors = self::get_safelist_errors();
+		if ( empty( $errors ) ) {
+			return;
+		}
+
+		echo '<div class="notice notice-warning"><p><strong>'
+			. esc_html__( 'Asset Optimizer: unused-CSS safelist', 'fw' ) . '</strong><br>'
+			. esc_html(
+				_n(
+					'This entry is not a valid pattern, so it is protecting nothing and CSS it was meant to keep may be removed:',
+					'These entries are not valid patterns, so they are protecting nothing and CSS they were meant to keep may be removed:',
+					count( $errors ),
+					'fw'
+				)
+			)
+			. '</p><ul style="margin-left:2em;list-style:disc">';
+		foreach ( $errors as $bad ) {
+			echo '<li><code>' . esc_html( $bad ) . '</code></li>';
+		}
+		echo '</ul><p>'
+			. esc_html__( 'Check the "Never remove (safelist)" field in the Asset Optimizer settings. A plain class name needs no slashes; only wrap an entry in slashes when it really is a regular expression.', 'fw' )
+			. '</p></div>';
 	}
 
 	/**
@@ -1798,6 +1939,70 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 	}
 
 	/**
+	 * Stop admin-only stylesheets being requested on the front end (opt-in).
+	 *
+	 * is_backend_css_handle() already identifies these, but it is only consulted
+	 * when BUILDING the combined file: excluding a handle from the bundle leaves
+	 * its original <link> in place, so the browser still fetches it as a separate
+	 * render-blocking request. On a measured page that was dashicons at 35.6 KB,
+	 * 100% unused, downloaded by every logged-out visitor for an icon font that
+	 * belongs to wp-admin. Excluding it from the bundle never addressed that; only
+	 * dequeuing does.
+	 *
+	 * Three deliberate limits:
+	 *
+	 *  - It stands down while the admin TOOLBAR is showing. The toolbar draws its
+	 *    own glyphs from dashicons, so dequeuing it there would visibly break the
+	 *    bar for logged-in users - and they are not the visitors whose page weight
+	 *    this is about.
+	 *  - It stands down for the front-end editor, which renders option-type CSS
+	 *    outside wp-admin and needs it (the same reason the rest of the optimizer
+	 *    does, see request_is_editor()).
+	 *  - It honours the URL-exclusion list, so a page can opt out.
+	 *
+	 * Opt-in because "admin-only" is a judgement about intent: a theme is free to
+	 * use a dashicon on the public site, and if it does, this would take the glyphs
+	 * away. The setting is the user's confirmation that it does not.
+	 *
+	 * @internal
+	 */
+	public function dequeue_admin_assets() {
+		if ( empty( $this->general_setting( 'drop_admin_assets', false ) ) ) {
+			return;
+		}
+		if ( $this->request_is_editor() || $this->request_is_excluded() ) {
+			return;
+		}
+		// The toolbar needs its icons; is_admin_bar_showing() is reliable by this
+		// point (wp_enqueue_scripts runs after the bar has been decided).
+		if ( function_exists( 'is_admin_bar_showing' ) && is_admin_bar_showing() ) {
+			return;
+		}
+
+		$styles = wp_styles();
+		if ( ! $styles || empty( $styles->queue ) ) {
+			return;
+		}
+
+		// Resolve the queue to its full dependency closure first: dashicons usually
+		// arrives as a DEPENDENCY of another handle rather than queued directly, so
+		// walking $styles->queue alone would miss it.
+		$styles->all_deps( $styles->queue );
+
+		foreach ( $styles->to_do as $handle ) {
+			$src = isset( $styles->registered[ $handle ] ) ? $styles->registered[ $handle ]->src : '';
+			if ( $this->is_backend_css_handle( $handle, (string) $src ) ) {
+				wp_dequeue_style( $handle );
+				wp_deregister_style( $handle );
+			}
+		}
+
+		// all_deps() populated to_do as a side effect; clear it so the normal
+		// print pass recomputes against the queue we just changed.
+		$styles->to_do = array();
+	}
+
+	/**
 	 * Whether a stylesheet is a backend/admin-only asset that must never enter
 	 * the frontend combined file.
 	 *
@@ -1891,6 +2096,20 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 	 */
 	/** Memoized result of request_is_editor(). */
 	private $request_is_editor_cache = null;
+
+	/**
+	 * Safelist patterns PCRE refused to compile, as a set keyed by the pattern.
+	 *
+	 * Static because the admin notice that reports them runs on a later hook than
+	 * the purge, and a bad pattern is a property of the SETTINGS, not of one
+	 * instance.
+	 *
+	 * @var array<string,bool>
+	 */
+	private static $safelist_errors = array();
+
+	/** Memoized output of validate_safelist(), keyed by the input list's hash. */
+	private $safelist_valid_cache = array();
 
 	private $settings_store_cache = null;
 
