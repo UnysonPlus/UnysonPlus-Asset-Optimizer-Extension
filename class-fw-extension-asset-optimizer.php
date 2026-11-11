@@ -7,6 +7,7 @@ require_once __DIR__ . '/includes/class-fw-ao-minifier.php';
 require_once __DIR__ . '/includes/class-fw-ao-webp.php';
 require_once __DIR__ . '/includes/class-fw-ao-subsizes.php';
 require_once __DIR__ . '/includes/class-fw-ao-purger.php';
+require_once __DIR__ . '/includes/class-fw-ao-speculation.php';
 
 class FW_Extension_Asset_Optimizer extends FW_Extension {
 
@@ -121,6 +122,17 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 			FW_AO_Webp::init();
 		}
 
+		// Instant navigation (opt-in via the mode setting; 'auto' leaves core alone).
+		// Registered in every context because the filters it adds are only consulted
+		// while a front-end page is being rendered, and core itself decides when that
+		// applies - it disables speculative loading for logged-in users outright.
+		FW_AO_Speculation::init(
+			(string) $this->general_setting( 'speculative_mode', 'auto' ),
+			(string) $this->general_setting( 'speculative_eagerness', 'auto' ),
+			(string) $this->general_setting( 'speculative_exclude', '' ),
+			(bool) $this->general_setting( 'speculative_skip_sensitive', true )
+		);
+
 		// Encoder quality for the theme's generated image crops. The crop pipeline
 		// lives in core (framework/includes/image-crops.php) and defaults to 82 on
 		// its own; this only surfaces the knob in the settings UI. Registered in
@@ -173,8 +185,14 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 		// later view is a cache hit and does no CSS work at all.
 		// One buffer, several passes. Purging and the LCP preload both need the
 		// finished HTML, so they share a single ob_start rather than nesting two.
-		if ( $this->purge_enabled() || $this->preload_lcp_enabled() || $this->hoist_styles_enabled() ) {
+		if ( $this->purge_enabled() || $this->preload_lcp_enabled() || $this->hoist_styles_enabled()
+			|| $this->critical_css_enabled() || $this->inline_small_css_enabled() ) {
 			add_action( 'template_redirect', array( $this, 'start_purge_buffer' ), 1 );
+		}
+
+		// Warm the below-the-fold images once the page is done loading (opt-in).
+		if ( $this->warm_images_enabled() ) {
+			add_action( 'wp_footer', array( $this, 'print_image_warmer' ), 99 );
 		}
 
 		// Final safety net: at shutdown, remember every handle that was enqueued
@@ -945,6 +963,18 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 	}
 
 	/**
+	 * The WebP quality from the settings, or 0 when unset.
+	 *
+	 * Public because FW_AO_Webp reads it; it is a General-tab value like any other,
+	 * but the encoder lives in its own class.
+	 *
+	 * @return int
+	 */
+	public function webp_quality_setting() {
+		return (int) $this->general_setting( 'webp_quality', 0 );
+	}
+
+	/**
 	 * Safelist patterns that could not be compiled on this request.
 	 *
 	 * @return string[]
@@ -1021,10 +1051,309 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 		if ( $this->purge_enabled() ) {
 			$html = $this->purge_buffer( $html );
 		}
+		if ( $this->critical_css_enabled() ) {
+			$html = $this->critical_css_buffer( $html );
+		}
+		if ( $this->inline_small_css_enabled() ) {
+			$html = $this->inline_small_css( $html );
+		}
 		if ( $this->preload_lcp_enabled() ) {
 			$html = $this->preload_lcp_image( $html );
 		}
 		return $html;
+	}
+
+	/** Is leftover-stylesheet inlining switched on, and is this a request it should touch? */
+	private function inline_small_css_enabled() {
+		if ( empty( $this->general_setting( 'inline_small_css', false ) ) ) {
+			return false;
+		}
+		if ( is_admin() || wp_doing_ajax() || ( defined( 'REST_REQUEST' ) && REST_REQUEST ) ) {
+			return false;
+		}
+		return ! $this->request_is_editor() && ! $this->request_is_excluded();
+	}
+
+	/**
+	 * Inline the small stylesheets that are still their own request.
+	 *
+	 * Combining cannot reach every stylesheet, and some of them it is deliberately
+	 * forbidden to touch. The Animation Engine is the worked example: it registers
+	 * `css_exclude_handles` to keep its on-demand per-style partials OUT of the
+	 * site-wide bundle - correctly, because that bundle is built from every handle
+	 * ever discovered, so folding them in would ship every effect's CSS on every
+	 * page, which is the exact bloat its on-demand loader exists to prevent. It
+	 * then folds the partials a page actually used into its own per-page file.
+	 *
+	 * The result is right in principle and still costs a round trip per leftover.
+	 * Measured on a real page: four such stylesheets of 1.0, 1.0, 0.8 and 1.1 KiB
+	 * blocking the first paint for an estimated 380 ms. **At that size the bytes are
+	 * not the cost, the round trips are** - which is precisely the case where
+	 * inlining wins, and the opposite of the full-bundle case the size cap on
+	 * `css_delivery: inline` exists to refuse.
+	 *
+	 * Inlining them per page also does not undo what the exclusion protects: each
+	 * page inlines only the files that page actually linked, so nothing becomes
+	 * site-wide.
+	 *
+	 * Runs last among the buffer passes, on the finished HTML, so it is indifferent
+	 * to which hook enqueued a stylesheet or how late - the thing that made these
+	 * four unreachable by the combiner in the first place.
+	 *
+	 * What it refuses to touch:
+	 *
+	 *  - anything bigger than the per-file cap, or past the per-page budget;
+	 *  - a media-scoped sheet (`print`, a query) - it is not blocking paint, and the
+	 *    media condition would be lost inline;
+	 *  - **a `<link>` inside `<noscript>`**, which would otherwise take the fallback
+	 *    copy that critical-CSS delivery puts there;
+	 *  - a stylesheet whose file cannot be resolved locally or read.
+	 *
+	 * Relative `url()` paths are rewritten against the stylesheet's own URL, since
+	 * the CSS no longer sits at that path.
+	 *
+	 * @param string $html
+	 * @return string
+	 */
+	private function inline_small_css( $html ) {
+		try {
+			/** Largest single stylesheet to inline, in bytes. */
+			$max = (int) apply_filters( 'fw_ao_inline_small_css_max_bytes', 4096 );
+			/** Total bytes this pass may move into one page. */
+			$budget = (int) apply_filters( 'fw_ao_inline_small_css_budget', 20480 );
+			if ( $max < 1 || $budget < 1 ) {
+				return $html;
+			}
+
+			if ( ! preg_match_all( '#<link\b[^>]*>#i', $html, $links, PREG_OFFSET_CAPTURE ) ) {
+				return $html;
+			}
+
+			// Ranges we must not touch: a <link> inside <noscript> is the no-JS
+			// fallback, and inlining it would apply it to everyone.
+			$skip_ranges = array();
+			if ( preg_match_all( '#<noscript\b.*?</noscript>#is', $html, $ns, PREG_OFFSET_CAPTURE ) ) {
+				foreach ( $ns[0] as $n ) {
+					$skip_ranges[] = array( $n[1], $n[1] + strlen( $n[0] ) );
+				}
+			}
+
+			$edits = array();
+			foreach ( $links[0] as $hit ) {
+				$tag    = $hit[0];
+				$offset = (int) $hit[1];
+
+				if ( ! preg_match( '#\brel=([\'"])\s*stylesheet\s*\1#i', $tag ) ) {
+					continue;
+				}
+				if ( ! preg_match( '#\bhref=([\'"])([^\'"]+)\1#i', $tag, $hm ) ) {
+					continue;
+				}
+				// Only an unconditional sheet: media absent, or all/screen.
+				if ( preg_match( '#\bmedia=([\'"])([^\'"]*)\1#i', $tag, $mm ) ) {
+					$media = strtolower( trim( $mm[2] ) );
+					if ( '' !== $media && 'all' !== $media && 'screen' !== $media ) {
+						continue;
+					}
+				}
+				$inside = false;
+				foreach ( $skip_ranges as $r ) {
+					if ( $offset >= $r[0] && $offset < $r[1] ) {
+						$inside = true;
+						break;
+					}
+				}
+				if ( $inside ) {
+					continue;
+				}
+
+				$url  = $hm[2];
+				$path = $this->url_to_path( $url );
+				if ( ! $path || ! is_readable( $path ) ) {
+					continue;
+				}
+				$size = (int) @filesize( $path );
+				if ( $size < 1 || $size > $max || $size > $budget ) {
+					continue;
+				}
+				$css = @file_get_contents( $path );
+				if ( false === $css || '' === trim( $css ) ) {
+					continue;
+				}
+
+				$css = $this->rewrite_urls( $css, $url );
+				$css = preg_replace( '#^\s*@charset\s+[^;]+;\s*#i', '', $css );
+				$css = str_ireplace( '</style', '<\/style', $css );
+
+				$edits[]  = array( $offset, strlen( $tag ), '<style>' . $css . '</style>' );
+				$budget  -= $size;
+				if ( $budget < 1 ) {
+					break;
+				}
+			}
+
+			if ( empty( $edits ) ) {
+				return $html;
+			}
+
+			// Apply from the end so each offset is still valid when it is used.
+			for ( $i = count( $edits ) - 1; $i >= 0; $i-- ) {
+				$html = substr_replace( $html, $edits[ $i ][2], $edits[ $i ][0], $edits[ $i ][1] );
+			}
+
+			return $html;
+		} catch ( Exception $e ) {
+			return $html;
+		} catch ( Error $e ) {
+			return $html;
+		}
+	}
+
+	/** Is critical-CSS inlining switched on, and is this a request it should touch? */
+	private function critical_css_enabled() {
+		if ( empty( $this->general_setting( 'critical_css', false ) ) ) {
+			return false;
+		}
+		if ( is_admin() || wp_doing_ajax() || ( defined( 'REST_REQUEST' ) && REST_REQUEST ) ) {
+			return false;
+		}
+		// Inline delivery has already put the whole sheet in the page; there is no
+		// render-blocking request left for this to remove.
+		if ( 'inline' === $this->general_setting( 'css_delivery', 'file' ) ) {
+			return false;
+		}
+		return ! $this->request_is_editor() && ! $this->request_is_excluded();
+	}
+
+	/**
+	 * Inline the first screen's CSS and load the rest without blocking paint.
+	 *
+	 * The problem this solves, and why neither existing option solves it: a linked
+	 * stylesheet blocks the first paint, and switching delivery to Inline removes
+	 * that block only by moving the whole sheet into every HTML response. On a
+	 * measured site the purged bundle was 338 KiB raw / 91 KiB gzipped against a
+	 * 50 KiB cap - nearly double, so inlining was refused, correctly: inlining it
+	 * would have added 91 KiB to every navigation to save one blocking request on
+	 * the first. Per-page purging makes that worse, not better, because each
+	 * template's sheet is different and so nothing is reused between pages.
+	 *
+	 * Critical CSS splits the difference along the only axis that matters: the
+	 * first screen needs a small fraction of the rules, and the rest can arrive
+	 * afterwards. So the subset the first screen depends on goes inline (small,
+	 * no request, no block) and the full sheet follows non-blocking and stays
+	 * cacheable and shared.
+	 *
+	 * How the subset is chosen: the same purger, run against the tokens of only
+	 * the first N elements of <body> (see collect_tokens_above_fold()), with an
+	 * EMPTY safelist. Empty is deliberate - the safelist exists to protect rules
+	 * for moments a static scan cannot see (hover, open, in-view), and those are
+	 * by definition not the first paint. They are in the full sheet, which lands
+	 * a moment later. Protecting them here would defeat the size reduction that
+	 * is the entire point.
+	 *
+	 * Delivery of the remainder uses `media="print"` plus an onload swap rather
+	 * than `rel=preload`: preload needs a polyfill to apply the sheet and can
+	 * double-fetch, while the media swap is understood by every browser that
+	 * matters and degrades to a plain stylesheet with the <noscript> copy.
+	 *
+	 * Bails - leaving the page exactly as it was - when there is no combined
+	 * <link> to work with, when the critical subset comes out implausibly small
+	 * (the scan failed) or so large it saves nothing.
+	 *
+	 * @param string $html
+	 * @return string
+	 */
+	private function critical_css_buffer( $html ) {
+		try {
+			// The purge pass runs first, so this href may already be the purged
+			// copy - which is what we want to split.
+			$pattern = '#<link\b[^>]*\bhref=([\'"])([^\'"]*?/' . preg_quote( self::CACHE_SUBDIR, '#' )
+				. '/(?:purged|combined)-[a-f0-9]+\.css)\1[^>]*>#i';
+			if ( ! preg_match( $pattern, $html, $m ) ) {
+				return $html;
+			}
+			$link_tag = $m[0];
+			$url      = $m[2];
+
+			$path = $this->url_to_path( $url );
+			if ( ! $path || ! is_readable( $path ) ) {
+				return $html;
+			}
+
+			/**
+			 * How many elements of <body> count as "the first screen".
+			 *
+			 * @param int $count
+			 */
+			$elements = (int) apply_filters( 'fw_ao_critical_css_elements', 200 );
+
+			$tokens = FW_AO_Purger::collect_tokens_above_fold( $html, $elements );
+			if ( empty( $tokens['classes'] ) && empty( $tokens['ids'] ) ) {
+				return $html; // nothing learned - refuse to split blind
+			}
+
+			$key  = substr( md5(
+				basename( $path ) . '|' . $elements . '|' .
+				md5( implode( ',', array_keys( $tokens['classes'] ) ) . '|' . implode( ',', array_keys( $tokens['ids'] ) ) ) . '|' .
+				(string) filemtime( $path )
+			), 0, 12 );
+			$dir  = $this->cache_dir();
+			$dest = trailingslashit( $dir ) . 'critical-' . $key . '.css';
+
+			$critical = '';
+			if ( file_exists( $dest ) ) {
+				$critical = (string) @file_get_contents( $dest );
+			} else {
+				$css = @file_get_contents( $path );
+				if ( false === $css || '' === $css ) {
+					return $html;
+				}
+				// Empty safelist: see the docblock. First paint only.
+				$critical = FW_AO_Purger::purge( $css, $tokens, array() );
+
+				$len = strlen( $critical );
+				// Under 1% of the sheet means the scan learned nothing useful;
+				// over 60% means there is no blocking request worth saving.
+				if ( $len < ( strlen( $css ) * 0.01 ) || $len > ( strlen( $css ) * 0.6 ) ) {
+					return $html;
+				}
+				if ( ! wp_mkdir_p( $dir ) ) {
+					return $html;
+				}
+				$this->ensure_cache_headers( $dir );
+				file_put_contents( $dest, $critical, LOCK_EX );
+			}
+
+			if ( '' === trim( $critical ) ) {
+				return $html;
+			}
+
+			// @charset is only valid in a linked sheet; a literal </style would end
+			// the block early. Same treatment as inline_purged_css().
+			$body = preg_replace( '#^\s*@charset\s+[^;]+;\s*#i', '', $critical );
+			$body = str_ireplace( '</style', '<\/style', $body );
+
+			// The remainder: same URL, fetched without blocking paint, then applied.
+			$async = preg_replace(
+				'#\bmedia=([\'"])[^\'"]*\1#i',
+				'media="print"',
+				$link_tag
+			);
+			if ( false === stripos( $async, 'media=' ) ) {
+				$async = preg_replace( '#\s*/?>$#', ' media="print">', $async, 1 );
+			}
+			$async = preg_replace( '#\s*/?>$#', " onload=\"this.media='all';this.onload=null\">", $async, 1 );
+
+			$replacement = '<style id="' . esc_attr( self::COMBINED_CSS_HANDLE ) . '-critical-css">' . $body . '</style>'
+				. $async
+				. '<noscript>' . $link_tag . '</noscript>';
+
+			return str_replace( $link_tag, $replacement, $html );
+		} catch ( Exception $e ) {
+			return $html;
+		} catch ( Error $e ) {
+			return $html;
+		}
 	}
 
 	/** Is the late-<style> hoist switched on, and is this a request it should touch? */
@@ -1298,7 +1627,10 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 
 		$style = '<style id="' . esc_attr( self::COMBINED_CSS_HANDLE ) . '-inline-css">' . $body . '</style>';
 
-		return preg_replace( $pattern, $style, $html, 1 );
+		// A callback, not a replacement string: in a replacement, PHP reads `\0`–`\99` and `$n`
+		// as back-references, and CSS is full of them (`content: "\00B7"` came out as the
+		// matched <link> tag).
+		return preg_replace_callback( $pattern, function () use ( $style ) { return $style; }, $html, 1 );
 	}
 
 	/**
@@ -1607,6 +1939,23 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 	 */
 	public function preload_lcp_image( $html ) {
 		try {
+			// fw_image_tag() prints exact per-device preloads next to a hero <picture>
+			// (one link per breakpoint, each with its own media query) and marks them
+			// data-fw-hoist. In <body> they would be found no earlier than the image
+			// itself, so move them into <head>; they then also stand in for the guess
+			// below, which cannot see a <picture>'s per-device sources.
+			if ( false !== strpos( $html, 'data-fw-hoist' ) && preg_match_all( '#<link\b[^>]*\bdata-fw-hoist\b[^>]*>#i', $html, $hoist ) ) {
+				$head_end = stripos( $html, '</head>' );
+				if ( false !== $head_end ) {
+					$moved = '';
+					foreach ( array_unique( $hoist[0] ) as $tag ) {
+						$html   = str_replace( $tag, '', $html );
+						$moved .= str_replace( ' data-fw-hoist', '', $tag ) . "\n";
+					}
+					$head_end = stripos( $html, '</head>' );
+					$html     = substr( $html, 0, $head_end ) . $moved . substr( $html, $head_end );
+				}
+			}
 			if ( false !== stripos( $html, 'rel="preload" as="image"' ) ) {
 				return $html; // something already preloads an image; don't compete
 			}
@@ -2097,6 +2446,125 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 	/** Memoized result of request_is_editor(). */
 	private $request_is_editor_cache = null;
 
+	/** Whether to warm below-the-fold images after load. */
+	public function warm_images_enabled() {
+		return ! empty( $this->general_setting( 'warm_images', false ) );
+	}
+
+	/**
+	 * Fetch the below-the-fold images into cache once the page has finished loading.
+	 *
+	 * A lazy image is not requested until the reader scrolls near it, so on a long page the
+	 * picture arrives into an empty slot a beat after the text - which reads as a slow site
+	 * even when the file is small and the server is quick. Measured on a real page: the first
+	 * content image was not even REQUESTED until 13.9 s, yet took 175 ms to arrive. The wait
+	 * was never the download; it was that nothing had asked for it yet.
+	 *
+	 * So: after `load`, when the connection is idle, quietly fetch what is left. By the time
+	 * the reader scrolls there, it is a cache hit and the image is simply already there.
+	 *
+	 * Why this does NOT simply flip the images to `loading="eager"`, which would be the
+	 * obvious implementation: a `sizes="auto"` image - WordPress emits these, and `auto` is
+	 * only valid together with `loading="lazy"` - would have its `sizes` become invalid the
+	 * moment it stopped being lazy, and the browser would fall back to `100vw`, fetching the
+	 * LARGEST candidate for a small slot. Strictly worse than doing nothing. Warming through a
+	 * separate request leaves every attribute alone and lets the browser pick for itself
+	 * later, from cache.
+	 *
+	 * Deliberately conservative, because this spends a visitor's bandwidth on something they
+	 * have not asked for yet: it waits for `load`, then for an idle moment; it skips Save-Data
+	 * and 2G outright; it fetches ONE image at a time so it never competes with something the
+	 * reader is actually waiting for; and it stops after a cap. Images the browser has already
+	 * loaded are skipped.
+	 *
+	 * Note this is for READERS, not for scores: Lighthouse never scrolls, so these images do
+	 * not load during an audit either way and the number will not move.
+	 *
+	 * @internal
+	 */
+	public function print_image_warmer() {
+		/**
+		 * How many below-the-fold images to warm, at most.
+		 *
+		 * @param int $max Default 24.
+		 */
+		$max = (int) apply_filters( 'fw:ext:asset-optimizer:warm_images_max', 24 );
+		if ( $max < 1 ) {
+			return;
+		}
+
+		$js = <<<'JS'
+(function(){
+var MAX=__MAX__;
+function cands(img){
+ var ss=img.getAttribute('srcset'),out=[];
+ if(ss){ss.split(',').forEach(function(p){
+  var m=p.trim().match(/^(\S+)(?:\s+([\d.]+)([wx]))?$/);
+  if(m){out.push({u:m[1],w:m[3]==='w'?parseFloat(m[2]):0});}
+ });}
+ return out;
+}
+function pick(img){
+ var c=cands(img),need=img.getBoundingClientRect().width*(window.devicePixelRatio||1);
+ if(!c.length){return img.getAttribute('src')||'';}
+ var byW=c.filter(function(o){return o.w>0;});
+ if(byW.length&&need>0){
+  byW.sort(function(a,b){return a.w-b.w;});
+  for(var i=0;i<byW.length;i++){if(byW[i].w>=need){return byW[i].u;}}
+  return byW[byW.length-1].u;
+ }
+ return c[0].u;
+}
+function run(){
+ var c=navigator.connection;
+ if(c&&(c.saveData||/(^|-)2g$/.test(c.effectiveType||''))){return;}
+ var list=[].slice.call(document.querySelectorAll('img[loading="lazy"]')).filter(function(i){return !i.complete;}).slice(0,MAX);
+ var n=0;
+ function step(){
+  if(n>=list.length){return;}
+  var u=pick(list[n++]);
+  if(!u){return step();}
+  var w=new Image();
+  try{w.fetchPriority='low';}catch(e){}
+  w.onload=w.onerror=step;
+  w.src=u;
+ }
+ for(var k=0;k<LANES&&k<list.length;k++){step();}
+}
+var started=0;
+function start(){if(started){return;}started=1;(window.requestIdleCallback||function(f){setTimeout(f,0);})(run,{timeout:1000});}
+var t=setTimeout(start,DELAY);
+addEventListener('load',function(){clearTimeout(t);start();});
+})();
+JS;
+		/**
+		 * How long to wait before warming when the page's `load` event is slow to arrive.
+		 *
+		 * @param int $ms Milliseconds. Default 2500.
+		 */
+		$delay = (int) apply_filters( 'fw:ext:asset-optimizer:warm_images_delay', 1200 );
+
+		/**
+		 * How many images to warm at once.
+		 *
+		 * Strictly serial was the original design, from before each request was marked
+		 * `fetchPriority = 'low'`. Low priority is the stronger guarantee - the browser
+		 * schedules these behind anything the reader is waiting for regardless of how many
+		 * are in flight - so serialising on top of it only made warming finish later than
+		 * the reader scrolls, which is the one way this feature can fail.
+		 *
+		 * @param int $lanes Default 4.
+		 */
+		$lanes = (int) apply_filters( 'fw:ext:asset-optimizer:warm_images_concurrency', 4 );
+		$js    = str_replace(
+			array( '__MAX__', 'DELAY', 'LANES' ),
+			array( (string) $max, (string) max( 0, $delay ), (string) max( 1, $lanes ) ),
+			$js
+		);
+		echo '<script id="fw-ao-warm-images">' . $js . '</script>' . "
+"; // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- generated script, no user input.
+	}
+
 	/**
 	 * Safelist patterns PCRE refused to compile, as a set keyed by the pattern.
 	 *
@@ -2350,7 +2818,7 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 		if ( ! $this->should_combine( 'css' ) ) {
 			return;
 		}
-		$per_page = ( 'site' !== $this->general_setting( 'css_scope', 'per_page' ) );
+		$per_page = ( 'site' !== $this->general_setting( 'css_scope', 'site' ) );
 		$known    = $per_page ? $this->get_page_css_handles() : $this->get_known_css_handles();
 
 		// Per-page scope only sees the live queue, so fold in the handles THIS
@@ -3114,6 +3582,16 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 			return;
 		}
 
+		// Registered HERE, before any early return below can skip it, and fired just
+		// before the footer prints rather than now: scripts enqueued late - by a
+		// shortcode during content rendering - do not exist yet at this point in the
+		// request, and those are exactly the leftovers worth deferring. Measured: the
+		// two shortcode scripts on a test page were invisible to the pass when it ran
+		// from here and stayed render-blocking.
+		if ( ! empty( $this->settings_store()['js_defer'] ) ) {
+			add_action( 'wp_print_footer_scripts', array( $this, '_defer_leftover_js' ), 0 );
+		}
+
 		// Resolve the dependency order of everything enqueued so far.
 		$wp_scripts->all_deps( $wp_scripts->queue );
 		$ordered = (array) $wp_scripts->to_do;
@@ -3229,6 +3707,80 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 		// The bundle is self-contained and dependency-ordered, so deferring it is
 		// safe. Opt-in; applied to its <script> tag via suppress_absorbed_js_tag().
 		$this->defer_combined_js = $defer;
+
+	}
+
+	/**
+	 * Ask WordPress to defer the footer scripts the combiner could not absorb.
+	 *
+	 * "Defer" used to mean only the bundle's own tag, which left the opposite
+	 * impression to the one the setting gives: the scripts MOST worth deferring are
+	 * exactly the ones the combiner refuses, because it refuses anything carrying
+	 * inline or localized data - and a page can easily end up with a deferred bundle
+	 * sitting among a dozen render-blocking leftovers. Measured on a real site: of
+	 * sixteen scripts in the body, four were deferred and twelve were not, and the
+	 * un-deferred ones accounted for the whole of the page's long-task time.
+	 *
+	 * The marking is done with `wp_script_add_data( $handle, 'strategy', 'defer' )`
+	 * rather than by injecting the attribute into the tag, and that choice is the
+	 * entire safety argument. WordPress then decides for itself, per handle, whether
+	 * deferring is actually valid - it downgrades a script back to blocking unless
+	 * every script that depends on it is also delayed, and it moves `after` inline
+	 * scripts into a matching deferred block instead of letting them run early
+	 * against a script that has not loaded. Writing ` defer` into the tag ourselves
+	 * would bypass all of that and break the first dependency chain it met.
+	 *
+	 * Scope is deliberately narrow: front-end footer scripts with a resolvable local
+	 * path. Core and admin handles are skipped, and so is anything remote, where a
+	 * third-party script may still rely on document.write.
+	 *
+	 * @internal Hooked to wp_print_footer_scripts:0.
+	 */
+	public function _defer_leftover_js() {
+		global $wp_scripts;
+
+		if ( ! ( $wp_scripts instanceof WP_Scripts ) ) {
+			return;
+		}
+
+		// Resolve the full dependency order as it now stands, so handles a shortcode
+		// enqueued during content rendering are included.
+		$wp_scripts->all_deps( $wp_scripts->queue );
+		$ordered = (array) $wp_scripts->to_do;
+		/**
+		 * Filters the handles that must never be marked `defer`.
+		 *
+		 * @param string[] $handles Handles to leave render-blocking.
+		 */
+		$keep_blocking = (array) apply_filters( 'fw:ext:asset-optimizer:js_no_defer_handles', array() );
+		$keep_blocking = $keep_blocking ? array_flip( $keep_blocking ) : array();
+
+		foreach ( (array) $ordered as $handle ) {
+			if ( isset( $this->absorbed_js_handles[ $handle ] ) || isset( $keep_blocking[ $handle ] ) ) {
+				continue;
+			}
+			if ( $handle === self::COMBINED_JS_HANDLE ) {
+				continue; // already handled by $defer_combined_js
+			}
+
+			$reg = isset( $wp_scripts->registered[ $handle ] ) ? $wp_scripts->registered[ $handle ] : null;
+			if ( ! $reg || ! $reg->src ) {
+				continue; // alias/meta handle
+			}
+			if ( $this->is_backend_js_handle( $handle, $reg->src ) || ! $this->url_to_path( $reg->src ) ) {
+				continue; // core/admin, or remote
+			}
+			if ( (int) $wp_scripts->get_data( $handle, 'group' ) !== 1 ) {
+				continue; // head scripts stay where the page put them
+			}
+
+			$strategy = isset( $reg->extra['strategy'] ) ? $reg->extra['strategy'] : '';
+			if ( '' !== $strategy ) {
+				continue; // the script already asked for async/defer itself
+			}
+
+			wp_script_add_data( $handle, 'strategy', 'defer' );
+		}
 	}
 
 	/**
@@ -3394,9 +3946,12 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 		}
 		$this->ensure_cache_headers( $dir );
 
+		$map = ! empty( $this->general_setting( 'js_source_map', false ) );
+
 		// The format token participates in the hash, so toggling minification
-		// invalidates previously cached bundles and forces a regeneration.
-		$signature = array( $minify ? 'fmt:js2-min' : 'fmt:js2' );
+		// invalidates previously cached bundles and forces a regeneration. The map
+		// flag joins it, because it changes where the line breaks fall (see below).
+		$signature = array( $minify ? 'fmt:js2-min' : 'fmt:js2', $map ? 'map:1' : 'map:0' );
 		foreach ( $items as $item ) {
 			$signature[] = $item['handle'] . '|' . $item['path'] . '|' . filemtime( $item['path'] );
 		}
@@ -3410,7 +3965,8 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 			return $fileurl;
 		}
 
-		$output = '';
+		$output  = '';
+		$offsets = array();
 		foreach ( $items as $item ) {
 			$js = @file_get_contents( $item['path'] );
 			if ( $js === false ) {
@@ -3424,6 +3980,36 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 			$js = preg_replace( '~^[ \t]*//[#@]\s*sourceMappingURL=.*$~mi', '', $js );
 			$js = preg_replace( '~/\*[#@]\s*sourceMappingURL=.*?\*/~i', '', $js );
 
+			if ( $map ) {
+				// Minify each source SEPARATELY so the line count is known before
+				// the next one is appended. Minifying the concatenation instead -
+				// what the normal path does - makes the final line numbers
+				// unknowable until afterwards, and strips the handle markers in the
+				// process, which is why a stack frame into the bundle could not be
+				// traced back to a file at all.
+				//
+				// FW_AO_Minifier::js() removes comments and insignificant
+				// whitespace; it does not rename or reorder anything, so doing it
+				// per file is equivalent in effect. The marker is added AFTER
+				// minifying, so it survives into the shipped bundle.
+				$piece = $minify ? FW_AO_Minifier::js( $js ) : $js;
+				$piece = "/* ==== " . $item['handle'] . " ==== */\n" . rtrim( $piece ) . "\n;\n";
+
+				$start = substr_count( $output, "\n" ) + 1;
+				$output .= $piece;
+				$end     = substr_count( $output, "\n" );
+
+				$offsets[] = array(
+					'handle' => $item['handle'],
+					'source' => $this->path_to_relative( $item['path'] ),
+					// 1-based and inclusive, counting the marker line, so a devtools
+					// line number can be compared directly.
+					'first_line' => $start,
+					'last_line'  => $end,
+				);
+				continue;
+			}
+
 			$output .= "/* ==== " . $item['handle'] . " ==== */\n" . rtrim( $js ) . "\n;\n";
 		}
 
@@ -3431,7 +4017,7 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 			return false;
 		}
 
-		if ( $minify ) {
+		if ( $minify && ! $map ) {
 			$output = FW_AO_Minifier::js( $output );
 		}
 
@@ -3439,9 +4025,48 @@ class FW_Extension_Asset_Optimizer extends FW_Extension {
 			return false;
 		}
 
+		if ( $map && ! empty( $offsets ) ) {
+			// Sidecar rather than a real source map: the combiner concatenates
+			// whole files, so a line range per source is all there is to say, and
+			// it needs no tooling to read. A .map would promise column-level
+			// mappings into each original that we do not have (and most sources
+			// here are already minified, with their own maps).
+			@file_put_contents(
+				$filepath . '.offsets.json',
+				wp_json_encode(
+					array(
+						'bundle'    => $filename,
+						'minified'  => (bool) $minify,
+						'generated' => gmdate( 'c' ),
+						'note'      => 'first_line/last_line are 1-based inclusive line numbers in ' . $filename,
+						'sources'   => $offsets,
+					),
+					defined( 'JSON_PRETTY_PRINT' ) ? JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES : 0
+				),
+				LOCK_EX
+			);
+		}
+
 		$this->maybe_gc( $dir, $filename );
 
 		return $fileurl;
+	}
+
+	/**
+	 * An absolute path shortened to something readable in the offsets file -
+	 * relative to the WordPress root where possible, so the map does not leak the
+	 * server's directory layout.
+	 *
+	 * @param string $abs
+	 * @return string
+	 */
+	private function path_to_relative( $abs ) {
+		$abs  = wp_normalize_path( (string) $abs );
+		$root = wp_normalize_path( ABSPATH );
+		if ( '' !== $root && 0 === strpos( $abs, $root ) ) {
+			return substr( $abs, strlen( $root ) );
+		}
+		return basename( $abs );
 	}
 
 

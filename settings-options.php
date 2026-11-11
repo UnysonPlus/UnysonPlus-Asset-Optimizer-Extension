@@ -230,13 +230,13 @@ $options = array(
 							'css_scope' => array(
 								'type'    => 'select',
 								'label'   => __( 'CSS combining scope', 'fw' ),
-								'desc'    => __( 'Per-page (default): each page combines ONLY the stylesheets it actually uses into its own file — smaller per page, in exact document order (best Lighthouse / GTmetrix “unused CSS” scores). Site-wide: one shared stylesheet built from every stylesheet discovered across the site, reused on every page (fewest downloads when a visitor browses many pages, but ships CSS the page does not use). JavaScript is always combined per-page.', 'fw' ),
+								'desc'    => __( 'Site-wide (default): one shared stylesheet built from every stylesheet discovered across the site, reused on every page. A visitor who looks at more than one page downloads it once and the browser serves the rest from cache, so only the first page pays for it. Per-page: each page combines ONLY the stylesheets it actually uses into its own file — smaller on any single page, in exact document order, and it scores better on the “unused CSS” audits because a one-page test never sees the saving a shared bundle is for. Prefer per-page when most visitors land on one page and leave. JavaScript is always combined per-page.', 'fw' ),
 								'no-validate' => true,
 								'choices' => array(
-									'per_page' => __( 'Per-page (each page combines its own CSS — default)', 'fw' ),
-									'site'     => __( 'Site-wide (one shared bundle)', 'fw' ),
+									'per_page' => __( 'Per-page (each page combines its own CSS)', 'fw' ),
+									'site'     => __( 'Site-wide (one shared bundle — default)', 'fw' ),
 								),
-								'value'   => 'per_page',
+								'value'   => 'site',
 							),
 							'css_delivery' => array(
 								'type'    => 'select',
@@ -261,6 +261,24 @@ $options = array(
 								'desc'  => __( 'One entry per line: any selector containing the text is kept. Wrap in slashes for a regular expression, e.g. <code>/^\\.promo-/</code>. Common state classes (<code>is-</code>, <code>has-</code>, <code>active</code>, <code>open</code>…), all hover/focus rules, animation and slider classes, and the Animation Engine are already protected — add entries here only for class names your own code adds with JavaScript.', 'fw' ),
 								'value' => '',
 							),
+							'critical_css' => array(
+								'type'  => 'switch',
+								'label' => __( 'Inline the first screen\'s CSS', 'fw' ),
+								'desc'  => __( 'A linked stylesheet holds up the first paint: the browser will not draw anything until it has the whole file. Switching <em>CSS delivery</em> to <em>Inline</em> removes that wait, but only by putting the entire stylesheet inside every page, which costs more than it saves on a site people browse — and on a large stylesheet it is refused outright. This takes the middle path. The rules the first screen actually needs are put straight into the page, and the rest of the stylesheet is fetched afterwards without holding anything up, so it still gets cached and reused across pages. On a measured site the stylesheet was 338&nbsp;KB (91&nbsp;KB compressed) — far too big to inline whole, while the part the first screen needed was a small fraction of it. <strong>Off by default, and check it before relying on it:</strong> which rules the first screen needs is worked out from the order of the page\'s own markup, not by drawing the page, so a layout whose main content sits late in the source can flash unstyled for an instant before the rest arrives. Load a few pages and watch the top of the screen as they appear. Requires <em>CSS delivery: Linked file</em>, and works best with <em>Remove unused CSS</em> on.', 'fw' ),
+								'value' => false,
+							),
+							'inline_small_css' => array(
+								'type'  => 'switch',
+								'label' => __( 'Inline small leftover stylesheets', 'fw' ),
+								'desc'  => __( 'Combining cannot reach every stylesheet. Some elements load their styling only on the pages that use it — which is the right thing to do, and it leaves those files outside the bundle. Each one is then its own request that the browser waits for before drawing, and at a kilobyte apiece the waiting, not the downloading, is the whole cost. On a measured page four such files of about a kilobyte each were holding up the first paint by an estimated 380&nbsp;ms between them. This puts their contents straight into the page where the link was, so they cost nothing to fetch. Only small files are moved, with a limit on the total per page, and anything scoped to a particular medium such as print is left alone. Independent of <em>CSS delivery</em> — it tidies up whatever is left over after the rest has been bundled.', 'fw' ),
+								'value' => false,
+							),
+							'js_source_map' => array(
+								'type'  => 'switch',
+								'label' => __( 'Record which script each line came from', 'fw' ),
+								'desc'  => __( 'Combining JavaScript into one file makes performance reports hard to act on: a browser that blames a slow function reports a line number in the <em>combined</em> file, which belongs to no script anyone wrote, so there is no way to tell whose code it is. Switching this on writes a small companion file next to the bundle listing which script occupies which lines, so a reported line can be traced back to the file it came from. <strong>For diagnosis, not for everyday use:</strong> it changes how the bundle is assembled (each script is shrunk on its own rather than all together), so leave it off unless you are chasing something. The companion file is public, and names script paths relative to your WordPress folder.', 'fw' ),
+								'value' => false,
+							),
 							'drop_admin_assets' => array(
 								'type'  => 'switch',
 								'label' => __( 'Drop admin-only stylesheets', 'fw' ),
@@ -278,6 +296,17 @@ $options = array(
 								'label' => __( 'Preload the hero image', 'fw' ),
 								'desc'  => __( 'Tell the browser about the page\'s main image straight away, instead of leaving it to find it after the stylesheet has downloaded and the layout is built. This does not make anything smaller — it changes the <em>order</em> things are fetched, which is usually where a slow "largest contentful paint" actually comes from. The hero is taken to be the first reasonably-sized image after your header, skipping logos and icons. Lazy images are deliberately <em>included</em> in that search, because the page builder marks every image lazy &mdash; including the one in your hero, which is exactly the element the score is measured on. Its <code>loading="lazy"</code> is removed. If no suitable image is found, nothing is added.', 'fw' ),
 								'value' => false,
+							),
+							'webp_quality' => array(
+								'type'       => 'slider',
+								'label'      => __( 'WebP quality', 'fw' ),
+								'desc'       => __( 'How hard to compress the WebP copies made for <em>Serve WebP images</em>. This is a separate control from <em>Image quality</em> above, because WebP and JPEG are not comparable at the same number — WebP holds up better, so it can be set lower for the same apparent result. <strong>80 is the default and is a safe place to stay</strong>; around 70 is noticeably smaller and still hard to fault on a photograph; below about 65 the difference starts to show on skies and smooth gradients, so look at an image you care about before keeping it. Changing this re-makes the copies the next time each image is shown, so the saving appears gradually rather than all at once. Only applies where the WebP copy actually comes out smaller than the original — if it does not, the original is kept.', 'fw' ),
+								'value'      => 80,
+								'properties' => array(
+									'min'  => 40,
+									'max'  => 100,
+									'step' => 1,
+								),
 							),
 							'image_quality' => array(
 								'type'       => 'slider',
@@ -307,6 +336,50 @@ $options = array(
 								'label' => __( 'Browser cache for static files', 'fw' ),
 								'desc'  => $fw_ao_static_cache_desc . __( 'Ask browsers to keep images, fonts, scripts and stylesheets for a year instead of re-checking them on every visit. This only affects <strong>repeat</strong> visits — a first-time visitor downloads everything either way — so treat it as a small, free win rather than a fix for a slow page. The generated files this extension makes are already cached this way; switching this on extends the same policy to your uploads, plugins and themes by adding a block to <code>wp-content/.htaccess</code> (anything already in that file is left alone, and turning this off removes only the block it added). Plugin and theme files carry a version in their URL that changes when they update, and WordPress never reuses an upload filename, so a normal update cannot leave anyone looking at a stale file. The one case to know about: if you replace a file in place — over FTP, or with a "replace media" plugin — people who already have it keep the old one until a hard refresh. Needs Apache or LiteSpeed; on nginx the rule belongs in your server config instead.', 'fw' ),
 								'value' => false,
+							),
+							'warm_images' => array(
+								'type'  => 'switch',
+								'label' => __( 'Load below-the-fold images early', 'fw' ),
+								'desc'  => __( 'Fetch the remaining images on the page once it has finished loading, instead of waiting for the reader to scroll to each one. A lazy image is not requested until the reader comes near it, so on a long page the picture drops into an empty slot a beat after the text — which reads as a slow site even when the file is tiny. On a measured page the first content image was not even <em>requested</em> until 13.9 seconds in, yet took 175&nbsp;ms to arrive: the wait was never the download, it was that nothing had asked for it yet. This fills that gap — after the page loads, during an idle moment, the remaining images are fetched one at a time so they are already in cache by the time anyone scrolls. It is deliberately cautious: Save-Data and 2G visitors are skipped entirely, only one image is in flight at a time so it never competes with anything you are waiting for, and it stops after 24 images. <strong>Worth knowing before you switch it on:</strong> this spends bandwidth on images a visitor may never scroll to, and it will usually make your PageSpeed score slightly <em>worse</em>, not better. The warmer starts after the page’s load event whether or not anyone scrolls, so an audit does download those images inside its measurement window even though Lighthouse never scrolls — on a measured site it turned a 0.7&nbsp;MB phone page load into about 2&nbsp;MB. Turn it on for readers on a long, image-heavy page, not for the number, and leave it off on a page whose images are large.', 'fw' ),
+								'value' => false,
+							),
+							'speculative_mode' => array(
+								'type'    => 'select',
+								'label'   => __( 'Instant navigation', 'fw' ),
+								'desc'    => __( 'Load the next page <em>before</em> it is clicked. Hover or begin a click on an internal link and the browser quietly fetches that page in the background, so the click lands on something already in memory — the trick that makes a React site feel instant, applied to a normal WordPress site. <strong>Prefetch</strong> fetches the HTML only; nothing on the page runs, so it is safe on any site and is the right first choice. <strong>Prerender</strong> goes further and renders the page completely in a hidden tab, which can make a click feel like it took no time at all — but the page really does run, so its scripts execute, its scroll animations may start and finish unseen, and analytics can count a visit nobody made. Test prerender before relying on it, especially with scroll-triggered motion. <strong>Auto</strong> leaves the decision to WordPress, which currently prefetches conservatively. Only Chromium browsers act on this today; Safari and Firefox simply navigate as they always did, so there is no downside to leaving it on. WordPress switches the whole feature off for logged-in users and for sites without pretty permalinks, so you will not see it while editing — check it in a logged-out window.', 'fw' ),
+								'no-validate' => true,
+								'choices' => array(
+									'auto'      => __( 'Auto — leave it to WordPress (default)', 'fw' ),
+									'prefetch'  => __( 'Prefetch — fetch the next page early (safe)', 'fw' ),
+									'prerender' => __( 'Prerender — render it fully in advance (fastest; test first)', 'fw' ),
+									'off'       => __( 'Off — never speculate', 'fw' ),
+								),
+								'value'   => 'auto',
+							),
+							'speculative_eagerness' => array(
+								'type'    => 'select',
+								'label'   => __( 'How early to start', 'fw' ),
+								'desc'    => __( 'How keen the browser should be. <strong>Conservative</strong> waits until the mouse goes down on a link — the click is already happening, so almost nothing is wasted, and it still removes most of the wait. <strong>Moderate</strong> starts after the pointer rests on a link for about 200ms, which usually means the page is ready by the time the click registers. <strong>Eager</strong> starts as soon as a link looks likely, which is the fastest and also the most wasteful: every page fetched and not visited is bandwidth your host paid for, and with <em>Prerender</em> it is a full page render too. Start conservative, move to moderate if you want more, and keep eager for small sites with few outgoing links. The browser caps how many speculations it runs at once regardless of what you ask for.', 'fw' ),
+								'no-validate' => true,
+								'choices' => array(
+									'auto'         => __( 'Auto — leave it to WordPress (default)', 'fw' ),
+									'conservative' => __( 'Conservative — on mouse-down', 'fw' ),
+									'moderate'     => __( 'Moderate — after a short hover', 'fw' ),
+									'eager'        => __( 'Eager — as soon as a link looks likely', 'fw' ),
+								),
+								'value'   => 'auto',
+							),
+							'speculative_skip_sensitive' => array(
+								'type'  => 'switch',
+								'label' => __( 'Never speculate cart, checkout or account pages', 'fw' ),
+								'desc'  => __( 'Keep shop and account pages out of it. WordPress already skips every link carrying a query string, which covers add-to-cart and logout links, but a cart or checkout page reached by a normal permalink is not covered and WooCommerce does not exclude it either. Fetching one starts a shopping session for a visitor who never went there; prerendering one also runs its scripts, which can fire a begin-checkout event or a stray page view. The pages are found from WooCommerce and Easy Digital Downloads directly rather than guessed from their slugs, so a renamed or translated checkout is still covered. Leave this on unless you have a specific reason not to — those pages are the ones nobody wants cached anyway.', 'fw' ),
+								'value' => true,
+							),
+							'speculative_exclude' => array(
+								'type'  => 'textarea',
+								'label' => __( 'Never speculate these paths', 'fw' ),
+								'desc'  => __( 'One path per line, each starting with a slash; <code>*</code> is a wildcard, and a pasted full URL is reduced to its path. Examples: <code>/cart/</code>, <code>/members/*</code>, <code>/downloads/*</code>. Use this for anything that <em>does</em> something when it is merely loaded — a download link, a one-click unsubscribe, a link that marks something read. WordPress already excludes wp-admin, <code>wp-*.php</code>, your uploads and theme folders, and every URL with a query string, so those need no entry. A single link can also opt out on its own by carrying <code>rel="nofollow"</code> or a <code>no-prefetch</code> / <code>no-prerender</code> class.', 'fw' ),
+								'value' => '',
 							),
 							'logged_out_only' => array(
 								'type'  => 'switch',

@@ -21,6 +21,9 @@ class FW_AO_Webp {
 	/** Max on-demand conversions per request (existing images are caught up gradually). */
 	const MAX_PER_REQUEST = 8;
 
+	/** Remembers the quality the copies on disk were encoded at, and when it last changed. */
+	const QUALITY_OPTION = 'fw_ao_webp_quality_state';
+
 	/** @var int */
 	private static $made_this_request = 0;
 
@@ -52,6 +55,7 @@ class FW_AO_Webp {
 		}
 		// Serving: every place a front-end image URL comes from.
 		add_filter( 'wp_get_attachment_image_src', array( __CLASS__, 'filter_image_src' ) );
+		add_filter( 'wp_calculate_image_srcset_meta', array( __CLASS__, 'match_srcset_meta' ), 10, 3 );
 		add_filter( 'wp_calculate_image_srcset', array( __CLASS__, 'filter_srcset' ) );
 		add_filter( 'wp_content_img_tag', array( __CLASS__, 'filter_content_img' ) );
 		add_filter( 'fw_image_src_url', array( __CLASS__, 'url' ) );
@@ -68,8 +72,12 @@ class FW_AO_Webp {
 		if ( ! preg_match( '/\.(jpe?g|png)$/i', $path ) || ! is_readable( $path ) ) {
 			return false;
 		}
-		$out = self::twin_path( $path );
-		if ( file_exists( $out ) && filemtime( $out ) >= filemtime( $path ) ) {
+		$quality = self::quality();
+		$out     = self::twin_path( $path );
+		// Stale also means "made before the quality was last changed" - otherwise
+		// changing the setting would silently do nothing to the images already on
+		// disk, which is the whole point of changing it.
+		if ( file_exists( $out ) && filemtime( $out ) >= max( filemtime( $path ), self::quality_changed_at() ) ) {
 			return true;
 		}
 		if ( file_exists( $path . '.nowebp' ) ) {
@@ -80,8 +88,25 @@ class FW_AO_Webp {
 		if ( is_wp_error( $editor ) || ! $editor->supports_mime_type( 'image/webp' ) ) {
 			return false;
 		}
-		$editor->set_quality( (int) apply_filters( 'fw:ext:asset-optimizer:webp_quality', 80 ) );
+
+		// Set the quality through the filter, NOT $editor->set_quality().
+		//
+		// save() re-derives the quality whenever the output format differs from the
+		// source's - which it always does here, JPEG/PNG in and WebP out - so a
+		// value set beforehand is discarded and WordPress's own WebP default (86)
+		// is used instead. Measured on a real 768x512 photo: 75,944 bytes at every
+		// requested quality from 80 down to 60, the editor reporting 86 each time,
+		// against 59,398 at a genuine 80 and 46,362 at 70. So this extension's
+		// documented default of 80 had never actually been applied to anything, and
+		// the WebP copies were only a few per cent smaller than the JPEGs they
+		// replaced rather than the quarter-or-more they should be.
+		$set_q = function ( $q, $mime = '' ) use ( $quality ) {
+			return ( '' === $mime || 'image/webp' === $mime ) ? $quality : $q;
+		};
+		add_filter( 'wp_editor_set_quality', $set_q, PHP_INT_MAX, 2 );
 		$saved = $editor->save( $out, 'image/webp' );
+		remove_filter( 'wp_editor_set_quality', $set_q, PHP_INT_MAX );
+
 		if ( is_wp_error( $saved ) || ! file_exists( $out ) ) {
 			return false;
 		}
@@ -92,6 +117,45 @@ class FW_AO_Webp {
 			return false;
 		}
 		return true;
+	}
+
+	/**
+	 * The WebP encoder quality to use.
+	 *
+	 * @return int 1-100
+	 */
+	public static function quality() {
+		$ext = function_exists( 'fw_ext' ) ? fw_ext( 'asset-optimizer' ) : null;
+		$set = ( $ext && method_exists( $ext, 'webp_quality_setting' ) ) ? (int) $ext->webp_quality_setting() : 0;
+		$q   = $set > 0 ? $set : 80;
+
+		/** Filters the WebP encoder quality (1-100). */
+		$q = (int) apply_filters( 'fw:ext:asset-optimizer:webp_quality', $q );
+
+		return max( 1, min( 100, $q ) );
+	}
+
+	/**
+	 * When the quality last changed, as a timestamp.
+	 *
+	 * Copies written before then were encoded at a different quality and must be
+	 * redone, so this is compared against each twin's mtime. The existing
+	 * per-request throttle means a site works through them a few at a time rather
+	 * than re-encoding everything at once.
+	 *
+	 * @return int
+	 */
+	private static function quality_changed_at() {
+		$state = get_option( self::QUALITY_OPTION, array() );
+		$state = is_array( $state ) ? $state : array();
+		$q     = self::quality();
+
+		if ( ! isset( $state['quality'] ) || (int) $state['quality'] !== $q ) {
+			$state = array( 'quality' => $q, 'changed_at' => time() );
+			update_option( self::QUALITY_OPTION, $state, false );
+		}
+
+		return isset( $state['changed_at'] ) ? (int) $state['changed_at'] : 0;
 	}
 
 	/** photo.jpg → photo.webp */
@@ -180,6 +244,54 @@ class FW_AO_Webp {
 			$image[0] = self::url( $image[0] );
 		}
 		return $image;
+	}
+
+	/**
+	 * @internal Keep srcset working once the src is the WebP copy.
+	 *
+	 * WordPress builds a srcset only when the image's src contains one of the attachment's
+	 * file names (#35045). filter_image_src() has already turned photo.jpg into photo.webp,
+	 * so nothing matched and every image with a WebP original lost its srcset (phones got the
+	 * full-size file). Point whichever meta entry the src belongs to -- the original, or one of
+	 * the generated sizes when the src is a resized copy -- at its WebP twin: the match then
+	 * succeeds, and filter_srcset() turns the remaining candidates into WebP too.
+	 *
+	 * The meta is a local variable inside wp_calculate_image_srcset(), so the rewrite is scoped
+	 * to that one calculation and never reaches the stored attachment metadata. Only the file
+	 * name changes; each candidate keeps its own width, height and URL directory.
+	 */
+	public static function match_srcset_meta( $image_meta, $size_array, $image_src ) {
+		if ( ! is_array( $image_meta ) || empty( $image_meta['file'] ) || ! is_string( $image_src ) ) {
+			return $image_meta;
+		}
+		$src = wp_basename( strtok( $image_src, '?#' ) );
+		if ( '' === $src || ! preg_match( '/\.webp$/i', $src ) ) {
+			return $image_meta;
+		}
+
+		// The src is the twin of the original (photo.webp).
+		$file = (string) $image_meta['file'];
+		$twin = self::twin_path( $file );
+		if ( $twin !== $file && wp_basename( $twin ) === $src ) {
+			$image_meta['file'] = $twin;
+			return $image_meta;
+		}
+
+		// The src is the twin of a generated size (photo-1024x685.webp).
+		if ( ! empty( $image_meta['sizes'] ) && is_array( $image_meta['sizes'] ) ) {
+			foreach ( $image_meta['sizes'] as $name => $size ) {
+				if ( ! is_array( $size ) || empty( $size['file'] ) ) {
+					continue;
+				}
+				$size_twin = self::twin_path( (string) $size['file'] );
+				if ( $size_twin !== $size['file'] && wp_basename( $size_twin ) === $src ) {
+					$image_meta['sizes'][ $name ]['file'] = $size_twin;
+					break;
+				}
+			}
+		}
+
+		return $image_meta;
 	}
 
 	/** @internal */

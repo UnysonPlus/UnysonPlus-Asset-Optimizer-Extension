@@ -155,6 +155,65 @@ class FW_AO_Purger {
 	}
 
 	/**
+	 * Collect tokens from only the FIRST part of the document, as a stand-in for
+	 * "what the visitor sees before scrolling".
+	 *
+	 * Critical CSS needs the subset of rules the first screen depends on. Knowing
+	 * that exactly means laying the page out, which needs a browser; we do not
+	 * have one server-side. The usable approximation is **document order**: the
+	 * markup near the top of <body> is, on essentially every real page, the markup
+	 * near the top of the screen. So we take the first N elements and judge the
+	 * stylesheet against those tokens alone.
+	 *
+	 * Approximation, with the failure modes named so they can be reasoned about:
+	 *
+	 *  - A page whose hero is late in the source (rendered into place by CSS grid
+	 *    or `order`) gets a critical set that misses it, and that part of the first
+	 *    screen paints unstyled for one frame.
+	 *  - A page with a large navigation spends much of the budget on the menu.
+	 *
+	 * Both err toward "too little critical CSS", which costs a flash; the opposite
+	 * error would cost the whole point of the feature. N is deliberately generous
+	 * for that reason, and the caller can change it.
+	 *
+	 * The <html> tag is included regardless of N, because its classes (`no-js`,
+	 * a theme's state classes) gate rules all over a stylesheet. The rest of
+	 * <head> is NOT: collect_tokens() deliberately sweeps quoted strings, and the
+	 * head is full of inline script, which would pull in half the sheet.
+	 *
+	 * @param string $html         The rendered document.
+	 * @param int    $max_elements How many elements of <body> to consider.
+	 * @return array{tags:array,classes:array,ids:array}
+	 */
+	public static function collect_tokens_above_fold( $html, $max_elements = 200 ) {
+		$max_elements = max( 1, (int) $max_elements );
+
+		$body_at = stripos( $html, '<body' );
+		if ( false === $body_at ) {
+			return self::collect_tokens( $html ); // not a document shape we understand
+		}
+
+		$html_tag = '';
+		if ( preg_match( '#<html\b[^>]*>#i', substr( $html, 0, $body_at ), $hm ) ) {
+			$html_tag = $hm[0];
+		}
+
+		$body = substr( $html, $body_at );
+
+		// Cut after the Nth opening tag. PREG_OFFSET_CAPTURE gives the byte offset
+		// so the slice lands on a tag boundary rather than mid-attribute.
+		$cut = 0;
+		if ( preg_match_all( '#<([a-zA-Z][a-zA-Z0-9-]*)#', $body, $m, PREG_OFFSET_CAPTURE ) ) {
+			if ( count( $m[0] ) > $max_elements ) {
+				$cut = (int) $m[0][ $max_elements ][1];
+			}
+		}
+		$prefix = $cut > 0 ? substr( $body, 0, $cut ) : $body;
+
+		return self::collect_tokens( $html_tag . $prefix );
+	}
+
+	/**
 	 * Purge a stylesheet against a document's tokens.
 	 *
 	 * @param string $css       Stylesheet source.
@@ -167,7 +226,119 @@ class FW_AO_Purger {
 		if ( ! is_string( $css ) || $css === '' ) {
 			return (string) $css;
 		}
-		return self::purge_block( $css, $tokens, $safelist );
+		return self::prune_keyframes( self::purge_block( $css, $tokens, $safelist ), $tokens, $safelist );
+	}
+
+	/**
+	 * Drop `@keyframes` blocks nothing left in the stylesheet can start.
+	 *
+	 * Keyframes used to be kept unconditionally, on the reasoning that an animation can
+	 * be started from JavaScript or an inline style that a CSS scan cannot see. That is
+	 * true, and it is why this is not a plain "is the name used in a rule" test - but
+	 * kept unconditionally it is expensive: an icon font's full animation set is around
+	 * 21 KB of keyframes on a page where nothing animates, which survived a purge that
+	 * had just removed the rules naming them.
+	 *
+	 * A name is kept if ANY of these hold, so the JS case stays covered:
+	 *   - some surviving declaration names it (`animation`, `animation-name`, and the
+	 *     shorthand, which is why the whole retained sheet is searched rather than parsed);
+	 *   - the name appears anywhere in the document's own tokens - a class, id or tag.
+	 *     `fa-beat` as a keyframes name is kept the moment a `.fa-beat` element exists,
+	 *     which is exactly how an element gets animated by script;
+	 *   - the safelist matches it, the same escape hatch selectors have.
+	 *
+	 * What is left is a name that appears in neither the stylesheet nor the document.
+	 * Starting one would require a script to invent the string, and a site doing that can
+	 * safelist it.
+	 *
+	 * @param string $css      Already-purged stylesheet.
+	 * @param array  $tokens   From collect_tokens().
+	 * @param array  $safelist Regex patterns.
+	 * @return string
+	 */
+	private static function prune_keyframes( $css, array $tokens, array $safelist ) {
+		/**
+		 * Filters whether unused `@keyframes` blocks are dropped during a purge.
+		 *
+		 * Off switch for a site that starts animations from a script by a name it builds
+		 * at runtime, which no scan can anticipate. Safelisting the names is the finer tool.
+		 *
+		 * @param bool $enabled Default true.
+		 */
+		if ( ! apply_filters( 'fw:ext:asset-optimizer:prune_keyframes', true ) ) {
+			return $css;
+		}
+
+		// Note the needle: `@-webkit-keyframes` does NOT contain `@keyframes`, so guarding
+		// on that spelling silently skipped every prefixed block.
+		if ( false === stripos( $css, 'keyframes' ) ) {
+			return $css;
+		}
+
+		// Every @keyframes block, with its name and byte range.
+		$blocks = array();
+		$offset = 0;
+		while ( preg_match( '#@(?:-[a-z]+-)?keyframes\s+([^\s{]+)\s*\{#i', $css, $m, PREG_OFFSET_CAPTURE, $offset ) ) {
+			$start = $m[0][1];
+			$open  = $start + strlen( $m[0][0] ) - 1;
+			$close = self::match_brace( $css, $open );
+			if ( $close === false ) {
+				break;
+			}
+			$blocks[] = array(
+				'name'  => trim( $m[1][0], "\"'" ),
+				'start' => $start,
+				'end'   => $close + 1,
+			);
+			$offset = $close + 1;
+		}
+		if ( ! $blocks ) {
+			return $css;
+		}
+
+		// The stylesheet with every keyframes block blanked out, so a name is not counted
+		// as "used" just because it labels its own block.
+		$rest = $css;
+		foreach ( $blocks as $b ) {
+			$rest = substr_replace( $rest, str_repeat( ' ', $b['end'] - $b['start'] ), $b['start'], $b['end'] - $b['start'] );
+		}
+
+		$present = array();
+		foreach ( array( 'classes', 'ids', 'tags' ) as $bucket ) {
+			if ( ! empty( $tokens[ $bucket ] ) && is_array( $tokens[ $bucket ] ) ) {
+				$present += $tokens[ $bucket ];
+			}
+		}
+
+		$drop = array();
+		foreach ( $blocks as $b ) {
+			$name = $b['name'];
+			if ( $name === '' || isset( $present[ $name ] ) ) {
+				continue;
+			}
+			if ( preg_match( '#(^|[^a-zA-Z0-9_-])' . preg_quote( $name, '#' ) . '([^a-zA-Z0-9_-]|$)#', $rest ) ) {
+				continue; // a surviving declaration names it
+			}
+			$safe = false;
+			foreach ( $safelist as $pattern ) {
+				if ( @preg_match( $pattern, $name ) ) {
+					$safe = true;
+					break;
+				}
+			}
+			if ( ! $safe ) {
+				$drop[] = $b;
+			}
+		}
+		if ( ! $drop ) {
+			return $css;
+		}
+
+		// Remove from the end so earlier offsets stay valid.
+		for ( $i = count( $drop ) - 1; $i >= 0; $i-- ) {
+			$css = substr_replace( $css, '', $drop[ $i ]['start'], $drop[ $i ]['end'] - $drop[ $i ]['start'] );
+		}
+		return $css;
 	}
 
 	/**
